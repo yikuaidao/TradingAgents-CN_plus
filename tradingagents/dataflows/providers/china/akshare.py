@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional, Union
 import pandas as pd
 
+from tradingagents.config.runtime_settings import get_int
 from ..base_provider import BaseStockDataProvider
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,9 @@ class AKShareProvider(BaseStockDataProvider):
             if not hasattr(requests, '_akshare_headers_patched'):
                 original_get = requests.get
                 last_request_time = {'time': 0}  # 使用字典以便在闭包中修改
+                
+                # 获取超时配置，默认为 30 秒（原为 10 秒）
+                default_timeout = get_int("TA_AKSHARE_TIMEOUT", "ta_akshare_timeout", 30)
 
                 def patched_get(url, **kwargs):
                     """
@@ -77,7 +81,7 @@ class AKShareProvider(BaseStockDataProvider):
                             # 使用 curl_cffi 模拟 Chrome 120 的 TLS 指纹
                             # 注意：使用 impersonate 时，不要传递自定义 headers，让 curl_cffi 自动设置
                             curl_kwargs = {
-                                'timeout': kwargs.get('timeout', 10),
+                                'timeout': kwargs.get('timeout', default_timeout),
                                 'impersonate': "chrome120"  # 模拟 Chrome 120
                             }
 
@@ -168,7 +172,7 @@ class AKShareProvider(BaseStockDataProvider):
     def _get_stock_news_direct(self, symbol: str, limit: int = 10) -> Optional[pd.DataFrame]:
         """
         直接调用东方财富网新闻 API（绕过 AKShare）
-        使用 curl_cffi 模拟真实浏览器，适用于 Docker 环境
+        优先使用 curl_cffi 模拟真实浏览器，如果失败则回退到 requests
 
         Args:
             symbol: 股票代码
@@ -177,60 +181,140 @@ class AKShareProvider(BaseStockDataProvider):
         Returns:
             新闻 DataFrame 或 None
         """
-        try:
-            from curl_cffi import requests as curl_requests
-            import json
-            import time
-            import os
+        import json
+        import time
+        
+        # 标准化股票代码
+        symbol_6 = symbol.zfill(6)
+        
+        # 获取超时配置
+        request_timeout = get_int("TA_AKSHARE_TIMEOUT", "ta_akshare_timeout", 30)
 
-            # 标准化股票代码
-            symbol_6 = symbol.zfill(6)
-
-            # 构建请求参数
-            url = "https://search-api-web.eastmoney.com/search/jsonp"
-            param = {
-                "uid": "",
-                "keyword": symbol_6,
-                "type": ["cmsArticleWebOld"],
-                "client": "web",
-                "clientType": "web",
-                "clientVersion": "curr",
-                "param": {
-                    "cmsArticleWebOld": {
-                        "searchScope": "default",
-                        "sort": "default",
-                        "pageIndex": 1,
-                        "pageSize": limit,
-                        "preTag": "<em>",
-                        "postTag": "</em>"
-                    }
+        # 构建请求参数
+        # 🔥 关键修复：优先使用 HTTP 协议，避免 Docker 环境下 HTTPS TLS 指纹被识别导致超时
+        # 经测试，HTTP 协议目前可绕过反爬虫
+        url_http = "http://search-api-web.eastmoney.com/search/jsonp"
+        url_https = "https://search-api-web.eastmoney.com/search/jsonp"
+        
+        param = {
+            "uid": "",
+            "keyword": symbol_6,
+            "type": ["cmsArticleWebOld"],
+            "client": "web",
+            "clientType": "web",
+            "clientVersion": "curr",
+            "param": {
+                "cmsArticleWebOld": {
+                    "searchScope": "default",
+                    "sort": "default",
+                    "pageIndex": 1,
+                    "pageSize": limit,
+                    "preTag": "<em>",
+                    "postTag": "</em>"
                 }
             }
+        }
 
-            params = {
-                "cb": f"jQuery{int(time.time() * 1000)}",
-                "param": json.dumps(param),
-                "_": str(int(time.time() * 1000))
+        params = {
+            "cb": f"jQuery{int(time.time() * 1000)}",
+            "param": json.dumps(param),
+            "_": str(int(time.time() * 1000))
+        }
+
+        response_text = None
+        
+        # 1. 尝试使用标准 requests + HTTP (最快，经测试在 Docker/服务器环境可行)
+        try:
+            import requests
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Referer': f'https://so.eastmoney.com/news/s?keyword={symbol_6}',
+                'Host': 'search-api-web.eastmoney.com',
+                'Accept': '*/*',
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                'Connection': 'keep-alive'
             }
-
-            # 使用 curl_cffi 发送请求
-            response = curl_requests.get(
-                url,
+            
+            # 缩短 HTTP 超时时间，快速失败
+            http_timeout = min(request_timeout, 5)
+            
+            response = requests.get(
+                url_http,
                 params=params,
-                timeout=10,
-                impersonate="chrome120"
+                headers=headers,
+                timeout=http_timeout
             )
+            
+            if response.status_code == 200:
+                response_text = response.text
+                # 简单验证是否包含数据
+                if "cmsArticleWebOld" not in response_text:
+                    self.logger.warning(f"⚠️ {symbol} HTTP 请求返回 200 但内容似乎无效，尝试 HTTPS")
+                    response_text = None
+            else:
+                self.logger.warning(f"⚠️ {symbol} HTTP 请求返回错误: {response.status_code}")
+                
+        except Exception as e:
+            self.logger.warning(f"⚠️ {symbol} HTTP 请求失败: {e}")
 
-            if response.status_code != 200:
-                self.logger.error(f"❌ {symbol} 东方财富网 API 返回错误: {response.status_code}")
+        # 2. 如果 HTTP 失败，尝试使用 curl_cffi + HTTPS (模拟浏览器指纹)
+        if response_text is None:
+            try:
+                from curl_cffi import requests as curl_requests
+                
+                # 使用 curl_cffi 发送请求
+                response = curl_requests.get(
+                    url_https,
+                    params=params,
+                    timeout=request_timeout,
+                    impersonate="chrome120"
+                )
+
+                if response.status_code == 200:
+                    response_text = response.text
+                else:
+                    self.logger.warning(f"⚠️ {symbol} curl_cffi (HTTPS) 请求返回状态码: {response.status_code}")
+
+            except Exception as e:
+                self.logger.warning(f"⚠️ {symbol} curl_cffi (HTTPS) 请求失败: {e}")
+
+        # 3. 如果 curl_cffi 也失败，最后尝试标准 requests + HTTPS (回退)
+        if response_text is None:
+            try:
+                import requests
+                
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Referer': 'https://www.eastmoney.com/',
+                    'Accept': '*/*',
+                    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                    'Connection': 'keep-alive'
+                }
+                
+                response = requests.get(
+                    url_https,
+                    params=params,
+                    headers=headers,
+                    timeout=request_timeout
+                )
+                
+                if response.status_code == 200:
+                    response_text = response.text
+                else:
+                    self.logger.error(f"❌ {symbol} requests (HTTPS) 请求返回错误: {response.status_code}")
+                    return None
+                    
+            except Exception as e:
+                self.logger.error(f"❌ {symbol} 直接调用 API (所有方法) 彻底失败: {e}")
                 return None
 
+        try:
             # 解析 JSONP 响应
-            text = response.text
-            if text.startswith("jQuery"):
-                text = text[text.find("(")+1:text.rfind(")")]
+            if response_text.startswith("jQuery"):
+                response_text = response_text[response_text.find("(")+1:response_text.rfind(")")]
 
-            data = json.loads(text)
+            data = json.loads(response_text)
 
             # 检查返回数据
             if "result" not in data or "cmsArticleWebOld" not in data["result"]:

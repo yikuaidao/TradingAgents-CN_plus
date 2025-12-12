@@ -17,7 +17,7 @@ services:
   # MongoDB数据库
   mongodb:
     # 升级到 7.0 以匹配现代技术栈 (Python 3.10+, Debian 12)
-    image: mongo:7.0
+    image: docker.1ms.run/mongo:7.0
     container_name: tradingagents-mongodb
     restart: unless-stopped
     # 仅在容器网络内部暴露端口，不对宿主机开放
@@ -41,9 +41,9 @@ services:
       retries: 5
       start_period: 10s
 
-  # Redis缓存
+  # Redis 缓存
   redis:
-    image: redis:7-alpine
+    image: docker.1ms.run/redis:7-alpine
     container_name: tradingagents-redis
     restart: unless-stopped
     # 仅在容器网络内部暴露端口，不对宿主机开放
