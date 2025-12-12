@@ -17,8 +17,13 @@ def load_agent_config(slug: str) -> str:
     """从YAML配置加载智能体角色定义"""
     try:
         # 优先读取 phase1_agents_config.yaml
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        agents_dir = os.path.dirname(current_dir)
+        # 优先从环境变量读取配置目录
+        env_dir = os.getenv("AGENT_CONFIG_DIR")
+        if env_dir and os.path.exists(env_dir):
+            agents_dir = env_dir
+        else:
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            agents_dir = os.path.dirname(current_dir)
         
         # 定义可能的配置文件列表
         config_files = ["phase1_agents_config.yaml", "stock_analysis_agents_config.yaml"]

@@ -29,8 +29,19 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/agent-configs", tags=["agent-configs"])
 
+import os
 # 项目根目录 / tradingagents/agents
-CONFIG_DIR = Path(__file__).resolve().parents[2] / "tradingagents" / "agents"
+DEFAULT_CONFIG_DIR = Path(__file__).resolve().parents[2] / "tradingagents" / "agents"
+
+def _get_config_dir() -> Path:
+    env_dir = os.getenv("AGENT_CONFIG_DIR")
+    if env_dir:
+        path = Path(env_dir)
+        if path.exists():
+            return path
+    return DEFAULT_CONFIG_DIR
+
+CONFIG_DIR = _get_config_dir()
 MAX_MODES = 200
 # 现有阶段配置中的提示词已远超 4k，为避免合法配置被拒绝，将上限提升
 # 如需更严格控制，可改为从配置文件读取或按环境变量覆盖
