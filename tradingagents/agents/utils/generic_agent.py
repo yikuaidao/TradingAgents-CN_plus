@@ -19,33 +19,42 @@ def load_agent_config(slug: str) -> str:
         # 优先读取 phase1_agents_config.yaml
         # 优先从环境变量读取配置目录
         env_dir = os.getenv("AGENT_CONFIG_DIR")
+        agents_dirs = []
+
         if env_dir and os.path.exists(env_dir):
-            agents_dir = env_dir
+            agents_dirs.append(env_dir)
         else:
             current_dir = os.path.dirname(os.path.abspath(__file__))
-            agents_dir = os.path.dirname(current_dir)
-        
+
+            # 1. 优先检查项目根目录下的 config/agents
+            # tradingagents/agents/utils -> tradingagents/agents -> tradingagents -> root
+            project_root = os.path.dirname(os.path.dirname(os.path.dirname(current_dir)))
+            config_agents_dir = os.path.join(project_root, "config", "agents")
+            if os.path.exists(config_agents_dir):
+                agents_dirs.append(config_agents_dir)
+
         # 定义可能的配置文件列表
         config_files = ["phase1_agents_config.yaml", "stock_analysis_agents_config.yaml"]
-        
-        for config_file in config_files:
-            yaml_path = os.path.join(agents_dir, config_file)
-            if not os.path.exists(yaml_path):
-                continue
-                
-            with open(yaml_path, 'r', encoding='utf-8') as f:
-                config = yaml.safe_load(f)
-            
-            # 检查 customModes
-            for agent in config.get('customModes', []):
-                if agent.get('slug') == slug:
-                    return agent.get('roleDefinition', '')
-                    
-            # 检查 agents (如果配置结构不同)
-            for agent in config.get('agents', []):
-                if agent.get('slug') == slug:
-                    return agent.get('roleDefinition', '')
-        
+
+        for agents_dir in agents_dirs:
+            for config_file in config_files:
+                yaml_path = os.path.join(agents_dir, config_file)
+                if not os.path.exists(yaml_path):
+                    continue
+
+                with open(yaml_path, 'r', encoding='utf-8') as f:
+                    config = yaml.safe_load(f)
+
+                # 检查 customModes
+                for agent in config.get('customModes', []):
+                    if agent.get('slug') == slug:
+                        return agent.get('roleDefinition', '')
+
+                # 检查 agents (如果配置结构不同)
+                for agent in config.get('agents', []):
+                    if agent.get('slug') == slug:
+                        return agent.get('roleDefinition', '')
+
         logger.warning(f"在配置中未找到智能体: {slug}")
         return ""
     except Exception as e:
@@ -70,20 +79,21 @@ class GenericAgent:
         self.llm = llm
         self.tools = tools
         self.system_message_template = system_message_template
-        
+
         # 初始化 Agent Executor
         self.agent_executor = None
         if tools:
             try:
+                # 直接从 langgraph.prebuilt 导入，因为 GenericAgent 基于 LangGraph 构建
                 from langgraph.prebuilt import create_react_agent
-                
+
                 # 使用官方 create_react_agent 创建标准执行器
                 # 不在此处传递 state_modifier，而在 run 中通过 messages 传递动态系统提示词
                 self.agent_executor = create_react_agent(
-                    model=llm, 
+                    model=llm,
                     tools=tools
                 )
-                logger.info(f"[{name}] ✅ 官方 ReAct Agent Executor 初始化成功")
+                logger.info(f"[{name}] ✅ LangGraph ReAct Agent Executor 初始化成功")
             except Exception as e:
                 logger.error(f"[{name}] ❌ Agent Executor 初始化失败: {e}")
                 self.agent_executor = None
@@ -128,7 +138,7 @@ class GenericAgent:
 
     def run(self, state: Dict[str, Any]) -> Dict[str, Any]:
         start_time = datetime.now()
-        
+
         current_date = state["trade_date"]
         ticker = state["company_of_interest"]
         session_id = state.get("session_id", "未知会话")
@@ -144,19 +154,25 @@ class GenericAgent:
         executed_tool_calls = 0
 
         # 动态构建系统提示词
-        system_msg_content = self.system_message_template or "您是一位专业的金融分析师。"
+        if not self.system_message_template:
+            raise ValueError(f"智能体 [{self.name}] ({self.slug}) 缺少系统提示词配置(system_message_template)。请检查配置文件。")
+        
+        system_msg_content = self.system_message_template
         # 简单替换常用占位符
         system_msg_content = system_msg_content.replace("{current_date}", str(current_date))
         system_msg_content = system_msg_content.replace("{ticker}", str(ticker))
         system_msg_content = system_msg_content.replace("{company_name}", str(company_name))
-        
+
         # 补充上下文
         context_info = (
             f"\n\n当前上下文信息:\n"
             f"当前日期: {current_date}\n"
             f"股票代码: {ticker}\n"
-            f"公司名称: {company_name}\n"
-            f"请用中文回答。"
+            f"请用中文回答。\n\n"
+            f"⚠️ 重要指令：\n"
+            f"1. 如果工具调用失败（返回错误信息），请在报告中如实记录失败原因，**严禁编造**虚假数据。\n"
+            f"2. 即使没有获取到完整数据，也请根据已知信息生成一份包含“错误说明”的报告。\n"
+            f"3. 你的报告将被用于最终汇总，请确保信息的真实性和准确性。"
         )
         system_msg_content += context_info
 
@@ -164,7 +180,7 @@ class GenericAgent:
         input_messages = []
         # 1. 添加系统消息
         input_messages.append(SystemMessage(content=system_msg_content))
-        
+
         # 2. 添加历史消息
         history_messages = list(state.get("messages", []))
         if history_messages:
@@ -177,16 +193,33 @@ class GenericAgent:
         if self.agent_executor:
             try:
                 logger.info(f"[{self.name}] 🚀 启动 LangGraph ReAct Agent...")
-                
+
                 result_state = self.agent_executor.invoke({
                     "messages": input_messages,
                 })
-                
+
                 result_messages = result_state.get("messages", [])
-                
+
+                # --- 增强调试日志 ---
+                logger.info(f"[{self.name}] 🔍 系统提示词预览 (前500字符):\n{system_msg_content[:500]}...")
+
+                tool_calls_log = []
+                for msg in result_messages:
+                    if isinstance(msg, ToolMessage):
+                        tool_calls_log.append(f"🛠️ 工具返回: {msg.name} (ID: {msg.tool_call_id}) -> {str(msg.content)[:200]}...")
+                    elif isinstance(msg, AIMessage) and msg.tool_calls:
+                        for tc in msg.tool_calls:
+                            tool_calls_log.append(f"📞 工具调用: {tc.get('name')} -> 参数: {tc.get('args')}")
+
+                if tool_calls_log:
+                    logger.info(f"[{self.name}] 📋 工具调用追踪:\n" + "\n".join(tool_calls_log))
+                else:
+                    logger.info(f"[{self.name}] ⚠️ 未检测到工具调用")
+                # -------------------
+
                 # 统计工具调用次数 (估算)
                 executed_tool_calls = sum(1 for msg in result_messages if isinstance(msg, ToolMessage))
-                
+
                 if result_messages and isinstance(result_messages[-1], AIMessage):
                     final_report = result_messages[-1].content
                     logger.info(f"[{self.name}] ✅ Agent 执行完成，报告长度: {len(final_report)}")
@@ -201,7 +234,7 @@ class GenericAgent:
             except Exception as e:
                 import traceback
                 logger.error(f"[{self.name}] ❌ Agent 执行崩溃: {e}\n{traceback.format_exc()}")
-                final_report = f"分析过程中发生错误: {str(e)}"
+                final_report = f"# ❌ 分析失败\n\n智能体执行过程中发生严重错误，无法完成分析。\n\n**错误详情**:\n```\n{str(e)}\n```\n\n请检查日志获取更多信息。"
         else:
              # 无工具模式：直接调用 LLM
              try:
@@ -210,30 +243,34 @@ class GenericAgent:
                  final_report = response.content
              except Exception as e:
                  logger.error(f"[{self.name}] ❌ LLM 直接调用失败: {e}")
-                 final_report = "无法进行分析。"
+                 final_report = f"# ❌ 分析失败\n\nLLM 调用失败。\n\n**错误详情**:\n{str(e)}"
 
         total_time = (datetime.now() - start_time).total_seconds()
         logger.info(f"[{self.name}] 完成，耗时 {total_time:.2f}s")
-        
+
         # 构造返回字典
         internal_key = self.slug.replace("-analyst", "").replace("-", "_")
         report_key = f"{internal_key}_report"
-        
+
+        # 🔥 确保 final_report 始终有值，即使发生异常
+        if not final_report:
+            final_report = "# ⚠️ 无报告生成\n\n智能体未返回有效内容。"
+
         # 🔥 给 AIMessage 添加 name 属性，作为最终的兜底提取机制
         # LangGraph 会自动合并 messages，这样即使 reports 字典被覆盖，也能从历史消息中找回
         ai_msg = AIMessage(content=final_report, name=report_key)
-        
+
         result = {
             "messages": [ai_msg],
             f"{internal_key}_tool_call_count": executed_tool_calls,
             "report": final_report
         }
-        
+
         result[report_key] = final_report
-        
+
         # 🔥 同时写入 reports 字典，支持动态添加的智能体（绕过 TypedDict 限制）
         result["reports"] = {report_key: final_report}
-        
+
         logger.info(f"[{self.name}] 📝 报告已写入 state['{report_key}'] 和 state['reports'] (msg.name={report_key})")
-            
+
         return result

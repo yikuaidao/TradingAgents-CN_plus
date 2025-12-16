@@ -347,6 +347,16 @@ def get_finnhub_company_insider_transactions(
         + "The change field reflects the variation in share count—here a negative number indicates a reduction in holdings—while share specifies the total number of shares involved. The transactionPrice denotes the per-share price at which the trade was executed, and transactionDate marks when the transaction occurred. The name field identifies the insider making the trade, and transactionCode (e.g., S for sale) clarifies the nature of the transaction. FilingDate records when the transaction was officially reported, and the unique id links to the specific SEC filing, as indicated by the source. Additionally, the symbol ties the transaction to a particular company, isDerivative flags whether the trade involves derivative securities, and currency notes the currency context of the transaction."
     )
 
+def get_finnhub_insider_sentiment(
+    ticker: Annotated[str, "ticker symbol"],
+    curr_date: Annotated[str, "Current date in yyyy-mm-dd format"],
+    look_back_days: Annotated[int, "how many days to look back"],
+):
+    """
+    Alias for get_finnhub_company_insider_sentiment
+    """
+    return get_finnhub_company_insider_sentiment(ticker, curr_date, look_back_days)
+
 
 def get_simfin_balance_sheet(
     ticker: Annotated[str, "ticker symbol"],
@@ -1512,16 +1522,16 @@ def get_china_stock_fundamentals_tushare(
 # ==================== 统一数据源接口 ====================
 
 def get_china_stock_data_unified(
-    ticker: Annotated[str, "中国股票代码，如：000001、600036等"],
+    ticker: Annotated[str, "股票代码 (A股/港股)，如：000001、00700.HK"],
     start_date: Annotated[str, "开始日期，格式：YYYY-MM-DD"],
     end_date: Annotated[str, "结束日期，格式：YYYY-MM-DD"]
 ) -> str:
     """
-    统一的中国A股数据获取接口
-    自动使用配置的数据源（默认Tushare），支持备用数据源
+    统一的股票数据获取接口 (支持A股和港股)
+    自动使用配置的数据源（默认Tushare/AKShare），支持备用数据源
 
     Args:
-        ticker: 股票代码
+        ticker: 股票代码 (支持A股 000001 和 港股 00700.HK)
         start_date: 开始日期
         end_date: 结束日期
 
@@ -1628,11 +1638,11 @@ def get_china_stock_data_unified(
 
 
 def get_china_stock_info_unified(
-    ticker: Annotated[str, "中国股票代码，如：000001、600036等"]
+    ticker: Annotated[str, "股票代码 (A股/港股)，如：000001、00700.HK"]
 ) -> str:
     """
-    统一的中国A股基本信息获取接口
-    自动使用配置的数据源（默认Tushare）
+    统一的股票基本信息获取接口 (支持A股和港股)
+    自动使用配置的数据源（默认Tushare/AKShare）
 
     Args:
         ticker: 股票代码
@@ -1747,7 +1757,8 @@ def get_current_china_data_source() -> str:
 
 def get_hk_stock_data_unified(symbol: str, start_date: str = None, end_date: str = None) -> str:
     """
-    获取港股数据的统一接口（根据用户配置选择数据源）
+    获取港股数据的统一接口
+    优先使用 DataSourceManager (Tushare/AKShare)，支持降级到 Yahoo Finance/Finnhub
 
     Args:
         symbol: 港股代码 (如: 0700.HK)
@@ -1775,34 +1786,40 @@ def get_hk_stock_data_unified(symbol: str, start_date: str = None, end_date: str
         except Exception as e:
             lookback_days = 60  # 默认60天
             logger.warning(f"⚠️ [港股配置验证] 无法获取配置，使用默认值: {lookback_days}天")
-            logger.warning(f"⚠️ [港股配置验证] 错误详情: {e}")
 
         # 使用 end_date 作为目标日期，向前回溯指定天数
         start_date, end_date = get_trading_date_range(end_date, lookback_days=lookback_days)
 
-        logger.info(f"📅 [港股智能日期] 原始输入: {original_start_date} 至 {original_end_date}")
-        logger.info(f"📅 [港股智能日期] 回溯天数: {lookback_days}天")
         logger.info(f"📅 [港股智能日期] 计算结果: {start_date} 至 {end_date}")
-        logger.info(f"📅 [港股智能日期] 实际天数: {(datetime.strptime(end_date, '%Y-%m-%d') - datetime.strptime(start_date, '%Y-%m-%d')).days}天")
 
+        # 1. 优先尝试使用 DataSourceManager (Tushare/AKShare)
+        try:
+            from .data_source_manager import get_data_source_manager
+            manager = get_data_source_manager()
+            
+            logger.info(f"🔄 [港股] 尝试使用 DataSourceManager 获取数据: {symbol}")
+            # get_stock_data 会自动处理 Tushare/AKShare 的调用和降级
+            result = manager.get_stock_data(symbol, start_date, end_date)
+            
+            if result and "❌" not in result and "错误" not in result:
+                logger.info(f"✅ [港股] DataSourceManager 获取成功: {symbol}")
+                return result
+            else:
+                logger.warning(f"⚠️ [港股] DataSourceManager 返回异常，尝试其他数据源: {result[:100]}...")
+        except Exception as e:
+            logger.error(f"⚠️ [港股] DataSourceManager 调用失败: {e}")
+
+        # 2. 尝试其他数据源 (Yahoo Finance, Finnhub)
         # 🔥 从数据库读取用户启用的数据源配置
         enabled_sources = _get_enabled_hk_data_sources()
 
         # 按优先级尝试各个数据源
         for source in enabled_sources:
-            if source == 'akshare' and AKSHARE_HK_AVAILABLE:
-                try:
-                    logger.info(f"🔄 使用AKShare获取港股数据: {symbol}")
-                    result = get_hk_stock_data_akshare(symbol, start_date, end_date)
-                    if result and "❌" not in result:
-                        logger.info(f"✅ AKShare港股数据获取成功: {symbol}")
-                        return result
-                    else:
-                        logger.warning(f"⚠️ AKShare返回错误结果，尝试下一个数据源")
-                except Exception as e:
-                    logger.error(f"⚠️ AKShare港股数据获取失败: {e}，尝试下一个数据源")
+            # 跳过 akshare，因为已经在 DataSourceManager 中尝试过了
+            if source == 'akshare':
+                continue
 
-            elif source == 'yfinance' and HK_STOCK_AVAILABLE:
+            if source == 'yfinance' and HK_STOCK_AVAILABLE:
                 try:
                     logger.info(f"🔄 使用Yahoo Finance获取港股数据: {symbol}")
                     result = get_hk_stock_data(symbol, start_date, end_date)
@@ -1846,7 +1863,8 @@ def get_hk_stock_data_unified(symbol: str, start_date: str = None, end_date: str
 
 def get_hk_stock_info_unified(symbol: str) -> Dict:
     """
-    获取港股信息的统一接口（根据用户配置选择数据源）
+    获取港股信息的统一接口
+    优先使用 DataSourceManager (Tushare/AKShare)，支持降级到 Yahoo Finance
 
     Args:
         symbol: 港股代码
@@ -1855,24 +1873,33 @@ def get_hk_stock_info_unified(symbol: str) -> Dict:
         Dict: 港股信息
     """
     try:
+        # 1. 优先尝试使用 DataSourceManager (Tushare/AKShare)
+        try:
+            from .data_source_manager import get_data_source_manager
+            manager = get_data_source_manager()
+            
+            logger.info(f"🔄 [港股信息] 尝试使用 DataSourceManager 获取信息: {symbol}")
+            result = manager.get_stock_info(symbol)
+            
+            if result and result.get('name') and result['name'] != f'股票{symbol}' and not result.get('name', '').startswith('港股'):
+                logger.info(f"✅ [港股信息] DataSourceManager 获取成功: {symbol} -> {result.get('name')}")
+                return result
+            else:
+                logger.warning(f"⚠️ [港股信息] DataSourceManager 返回默认信息，尝试其他数据源")
+        except Exception as e:
+            logger.error(f"⚠️ [港股信息] DataSourceManager 调用失败: {e}")
+
+        # 2. 尝试其他数据源 (Yahoo Finance)
         # 🔥 从数据库读取用户启用的数据源配置
         enabled_sources = _get_enabled_hk_data_sources()
 
         # 按优先级尝试各个数据源
         for source in enabled_sources:
-            if source == 'akshare' and AKSHARE_HK_AVAILABLE:
-                try:
-                    logger.info(f"🔄 使用AKShare获取港股信息: {symbol}")
-                    result = get_hk_stock_info_akshare(symbol)
-                    if result and 'error' not in result and not result.get('name', '').startswith('港股'):
-                        logger.info(f"✅ AKShare成功获取港股信息: {symbol} -> {result.get('name', 'N/A')}")
-                        return result
-                    else:
-                        logger.warning(f"⚠️ AKShare返回默认信息，尝试下一个数据源")
-                except Exception as e:
-                    logger.error(f"⚠️ AKShare港股信息获取失败: {e}，尝试下一个数据源")
+            # 跳过 akshare，因为已经在 DataSourceManager 中尝试过了
+            if source == 'akshare':
+                continue
 
-            elif source == 'yfinance' and HK_STOCK_AVAILABLE:
+            if source == 'yfinance' and HK_STOCK_AVAILABLE:
                 try:
                     logger.info(f"🔄 使用Yahoo Finance获取港股信息: {symbol}")
                     result = get_hk_stock_info(symbol)

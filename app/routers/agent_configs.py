@@ -30,16 +30,20 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/agent-configs", tags=["agent-configs"])
 
 import os
-# 项目根目录 / tradingagents/agents
-DEFAULT_CONFIG_DIR = Path(__file__).resolve().parents[2] / "tradingagents" / "agents"
+
 
 def _get_config_dir() -> Path:
+    # 1. 优先从环境变量读取
     env_dir = os.getenv("AGENT_CONFIG_DIR")
     if env_dir:
         path = Path(env_dir)
         if path.exists():
             return path
-    return DEFAULT_CONFIG_DIR
+            
+    # 2. 默认使用项目根目录下的 config/agents (用户自定义配置)
+    project_root = Path(__file__).resolve().parents[2]
+    config_agents_dir = project_root / "config" / "agents"
+    return config_agents_dir
 
 CONFIG_DIR = _get_config_dir()
 MAX_MODES = 200

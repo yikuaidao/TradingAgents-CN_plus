@@ -20,9 +20,9 @@ services:
     image: docker.1ms.run/mongo:7.0
     container_name: tradingagents-mongodb
     restart: unless-stopped
-    # 仅在容器网络内部暴露端口，不对宿主机开放
-    expose:
-      - "27017"
+    # 映射端口到宿主机，方便本地开发调试
+    ports:
+      - "27017:27017"
     volumes:
       - tradingagents_mongodb_data:/data/db
       # 注意：不挂载初始化脚本，使用 MongoDB 自动创建的 root 用户
@@ -185,7 +185,7 @@ services:
   # Nginx 反向代理
   # ports可以改为8080:80,或者其它的端口映射，前面一个是外部的端口，后面一个是容器内的端口
   nginx:
-    image: nginx:alpine
+    image: docker.1ms.run/nginx:alpine
     container_name: tradingagents-nginx
     restart: unless-stopped
     ports:

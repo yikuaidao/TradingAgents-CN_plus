@@ -162,7 +162,7 @@ class MultiSourceBasicsSyncService:
 
         try:
             # Step 1: 获取数据源管理器
-            from app.services.data_sources.manager import DataSourceManager
+            from tradingagents.dataflows.manager import DataSourceManager
             manager = DataSourceManager()
             available_adapters = manager.get_available_adapters()
 

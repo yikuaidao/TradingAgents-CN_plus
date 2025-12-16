@@ -39,12 +39,12 @@ class StockUtils:
 
         ticker = str(ticker).strip().upper()
 
-        # 中国A股：6位数字
-        if re.match(r'^\d{6}$', ticker):
+        # 中国A股：6位数字 或 6位数字.(SZ|SH|BJ)
+        if re.match(r'^\d{6}(\.(SZ|SH|BJ))?$', ticker):
             return StockMarket.CHINA_A
 
-        # 港股：4-5位数字.HK 或 纯4-5位数字（支持0700.HK、09988.HK、00700、9988格式）
-        if re.match(r'^\d{4,5}\.HK$', ticker) or re.match(r'^\d{4,5}$', ticker):
+        # 港股：1-5位数字.HK 或 纯1-5位数字（支持0700.HK、700、00700格式）
+        if re.match(r'^\d{1,5}\.HK$', ticker) or re.match(r'^\d{1,5}$', ticker):
             return StockMarket.HONG_KONG
 
         # 美股：1-5位字母
@@ -152,14 +152,19 @@ class StockUtils:
             
         ticker = str(ticker).strip().upper()
         
-        # 如果是纯4-5位数字，添加.HK后缀
-        if re.match(r'^\d{4,5}$', ticker):
-            return f"{ticker}.HK"
+        # 如果是纯1-5位数字，补齐为5位并添加.HK后缀
+        if re.match(r'^\d{1,5}$', ticker):
+            return f"{ticker.zfill(5)}.HK"
 
         # 如果已经是正确格式，直接返回
-        if re.match(r'^\d{4,5}\.HK$', ticker):
+        if re.match(r'^\d{5}\.HK$', ticker):
             return ticker
             
+        # 如果是少于5位的.HK格式 (e.g. 700.HK)，补齐
+        if re.match(r'^\d{1,4}\.HK$', ticker):
+             code = ticker.split('.')[0]
+             return f"{code.zfill(5)}.HK"
+
         return ticker
     
     @staticmethod

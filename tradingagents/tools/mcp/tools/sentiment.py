@@ -76,9 +76,21 @@ def get_stock_sentiment(
                     logger.info(f"✅ [MCP情绪工具] 中文情绪数据获取成功")
                 else:
                     logger.warning(f"⚠️ [MCP情绪工具] 中文情绪数据为空或过短，尝试备用源")
-                    # 备用：Reddit新闻
+                    # 备用：Reddit新闻 (需要处理路径问题和导入)
                     try:
-                        from tradingagents.dataflows.interface import get_reddit_company_news
+                        # 确保路径存在
+                        import os
+                        from tradingagents.config.config_manager import config_manager
+                        data_dir = config_manager.get_data_dir()
+                        reddit_path = os.path.join(data_dir, "reddit_data", "company_news")
+                        os.makedirs(reddit_path, exist_ok=True)
+                        
+                        try:
+                            from tradingagents.dataflows.interface import get_reddit_company_news
+                        except ImportError:
+                            # 尝试直接导入
+                            from tradingagents.dataflows.news.reddit import get_company_news as get_reddit_company_news
+                            
                         reddit_data = get_reddit_company_news(ticker, curr_date, 7, 5)
                         result_data.append(f"## Reddit讨论(备用)\n{reddit_data}")
                     except Exception as e:
@@ -86,7 +98,7 @@ def get_stock_sentiment(
 
             except Exception as e:
                 logger.error(f"❌ [MCP情绪工具] 中文情绪获取失败: {e}")
-                result_data.append(f"## 市场情绪分析\n⚠️ 获取失败: {e}")
+                result_data.append(f"## 市场情绪分析\n暂无数据 (数据源访问异常)")
 
         else:
             # 美股：使用Finnhub内幕交易和情绪数据
@@ -95,8 +107,13 @@ def get_stock_sentiment(
             try:
                 # 尝试获取内幕交易情绪
                 try:
-                    from tradingagents.dataflows.interface import get_finnhub_insider_sentiment
-                    insider_sentiment = get_finnhub_insider_sentiment(ticker, curr_date)
+                    try:
+                        from tradingagents.dataflows.interface import get_finnhub_company_insider_sentiment
+                    except ImportError:
+                        # 如果interface没有导出，可能是名字不匹配，尝试直接导入或使用别名
+                        from tradingagents.dataflows.interface import get_finnhub_company_insider_sentiment
+                    
+                    insider_sentiment = get_finnhub_company_insider_sentiment(ticker, curr_date, 30)
                     if insider_sentiment:
                         result_data.append(f"## 内部人士情绪\n{insider_sentiment}")
                 except Exception as e:
@@ -104,7 +121,18 @@ def get_stock_sentiment(
                 
                 # 尝试获取Reddit讨论
                 try:
-                    from tradingagents.dataflows.interface import get_reddit_company_news
+                    # 确保路径存在
+                    import os
+                    from tradingagents.config.config_manager import config_manager
+                    data_dir = config_manager.get_data_dir()
+                    reddit_path = os.path.join(data_dir, "reddit_data", "company_news")
+                    os.makedirs(reddit_path, exist_ok=True)
+
+                    try:
+                        from tradingagents.dataflows.interface import get_reddit_company_news
+                    except ImportError:
+                        from tradingagents.dataflows.news.reddit import get_company_news as get_reddit_company_news
+
                     reddit_info = get_reddit_company_news(ticker, curr_date, 7, 5)
                     if reddit_info:
                         result_data.append(f"## Reddit讨论\n{reddit_info}")
@@ -112,11 +140,11 @@ def get_stock_sentiment(
                     logger.warning(f"⚠️ [MCP情绪工具] Reddit数据获取失败: {e}")
 
                 if not result_data:
-                    result_data.append("## 市场情绪分析\n⚠️ 暂无可用的情绪数据")
+                    result_data.append("## 市场情绪分析\n暂无数据")
 
             except Exception as e:
                 logger.error(f"❌ [MCP情绪工具] 美股情绪获取失败: {e}")
-                result_data.append(f"## 市场情绪分析\n⚠️ 获取失败: {e}")
+                result_data.append(f"## 市场情绪分析\n暂无数据 (数据源访问异常)")
 
         # 计算执行时间
         execution_time = (datetime.now() - start_time).total_seconds()

@@ -53,14 +53,45 @@ class LocalMCPServer:
             return
         
         # 设置工具配置
-        from tradingagents.tools.mcp.tools import news, market, fundamentals, sentiment, china
+        from tradingagents.tools.mcp.tools import news, market, fundamentals, sentiment, china, finance
         
         news.set_toolkit_config(self.toolkit)
         market.set_toolkit_config(self.toolkit)
         fundamentals.set_toolkit_config(self.toolkit)
         sentiment.set_toolkit_config(self.toolkit)
         china.set_toolkit_config(self.toolkit)
+        # finance module configuration if needed in future
+
+        # 注册 Finance Tools (17 tools)
+        finance_funcs = [
+            finance.get_stock_data,
+            finance.get_stock_data_minutes,
+            finance.get_company_performance,
+            finance.get_company_performance_hk,
+            finance.get_company_performance_us,
+            finance.get_macro_econ,
+            finance.get_money_flow,
+            finance.get_margin_trade,
+            finance.get_fund_data,
+            finance.get_fund_manager_by_name,
+            finance.get_index_data,
+            finance.get_csi_index_constituents,
+            finance.get_convertible_bond,
+            finance.get_block_trade,
+            finance.get_dragon_tiger_inst,
+            finance.get_finance_news,
+            finance.get_hot_news_7x24,
+            finance.get_current_timestamp
+        ]
         
+        for func in finance_funcs:
+            try:
+                # 使用 tool() 装饰器注册函数
+                self._mcp.tool()(func)
+                self._tools[func.__name__] = func
+            except Exception as e:
+                logger.error(f"Failed to register tool {func.__name__}: {e}")
+
         # 注册新闻工具
         @self._mcp.tool()
         def get_stock_news(stock_code: str, max_news: int = 10) -> str:

@@ -3,6 +3,8 @@ AKShare data source adapter
 """
 from typing import Optional, Dict
 import logging
+import requests
+import json
 from datetime import datetime, timedelta
 import pandas as pd
 
@@ -28,6 +30,24 @@ class AKShareAdapter(DataSourceAdapter):
         """检查AKShare是否可用"""
         try:
             import akshare as ak  # noqa: F401
+            
+            # 修复 pandas read_excel 问题
+            import pandas as pd
+            if not hasattr(pd, '_read_excel_patched_adapter'):
+                original_read_excel = pd.read_excel
+                
+                def patched_read_excel(io, **kwargs):
+                    if 'engine' not in kwargs:
+                        # 优先尝试 openpyxl
+                        try:
+                            return original_read_excel(io, engine='openpyxl', **kwargs)
+                        except:
+                            pass
+                    return original_read_excel(io, **kwargs)
+                    
+                pd.read_excel = patched_read_excel
+                pd._read_excel_patched_adapter = True
+                
             return True
         except ImportError:
             return False
@@ -292,6 +312,901 @@ class AKShareAdapter(DataSourceAdapter):
             logger.error(f"获取AKShare {source} 实时快照失败: {e}")
             return None
 
+    def _to_em_symbol(self, ts_code: str) -> str:
+        """Convert ts_code (000001.SZ) to EM symbol (SZ000001)"""
+        if not ts_code: return ""
+        code, market = ts_code.split('.')
+        if market.upper() == 'SH':
+            return f"SH{code}"
+        elif market.upper() == 'SZ':
+            return f"SZ{code}"
+        elif market.upper() == 'BJ':
+            return f"BJ{code}"
+        return result
+
+    def _fetch_stock_news_em_custom(self, symbol: str) -> Optional[pd.DataFrame]:
+        """
+        替代 ak.stock_news_em 的自定义抓取方法
+        抓取东方财富股吧资讯页面: https://guba.eastmoney.com/list,{symbol},1,f.html
+        """
+        try:
+            from parsel import Selector
+        except ImportError:
+            logger.error("parsel not installed, cannot fetch news")
+            return None
+
+        url = f"https://guba.eastmoney.com/list,{symbol},1,f.html"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code != 200:
+                logger.warning(f"Failed to fetch EM news: HTTP {resp.status_code}")
+                return None
+                
+            sel = Selector(text=resp.text)
+            items = sel.css(".listitem")
+            
+            data = []
+            current_year = datetime.now().year
+            
+            for item in items:
+                try:
+                    title = item.css(".title a::text").get()
+                    link = item.css(".title a::attr(href)").get()
+                    update_time = item.css(".update::text").get()
+                    
+                    if not title or not link:
+                        continue
+                        
+                    # 处理链接
+                    if not link.startswith("http"):
+                        link = "https://guba.eastmoney.com" + link if link.startswith("/") else "https://guba.eastmoney.com/" + link
+                    
+                    # 处理时间 (MM-DD HH:mm)
+                    if update_time:
+                        full_time_str = f"{current_year}-{update_time}"
+                        try:
+                            dt = datetime.strptime(full_time_str, "%Y-%m-%d %H:%M")
+                            # 如果生成的时间比当前时间晚很多（比如当前1月，解析出12月），可能是去年
+                            if dt > datetime.now() + timedelta(days=30):
+                                full_time_str = f"{current_year - 1}-{update_time}"
+                        except:
+                            pass
+                    else:
+                        full_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        
+                    data.append({
+                        "title": title,
+                        "url": link,
+                        "datetime": full_time_str,
+                        "source": "东方财富",
+                        "code": symbol
+                    })
+                except Exception as e:
+                    continue
+                    
+            if not data:
+                return None
+                
+            return pd.DataFrame(data)
+            
+        except Exception as e:
+            logger.error(f"Error fetching EM news custom: {e}")
+            return None
+
+    def query(self, api_name: str, **kwargs) -> Optional[pd.DataFrame]:
+        """
+        通用查询接口，模拟 Tushare 的 pro.query 接口
+        """
+        if not self.is_available():
+            return None
+            
+        try:
+            import akshare as ak
+            
+            # 参数预处理
+            ts_code = kwargs.get('ts_code', '')
+            symbol = ts_code.split('.')[0] if ts_code else kwargs.get('symbol', '')
+            start_date = kwargs.get('start_date', '')
+            end_date = kwargs.get('end_date', '')
+            
+            logger.info(f"AKShare query: {api_name} for {symbol} ({start_date}-{end_date})")
+
+            # --- 宏观经济数据 ---
+            if api_name == 'cn_gdp' or api_name == 'gdp':
+                df = ak.macro_china_gdp()
+                # 统一字段名
+                df = df.rename(columns={'季度': 'quarter', '国内生产总值-绝对值': 'gdp', '国内生产总值-同比增长': 'gdp_yoy'})
+                return self._filter_by_date(df, 'quarter', start_date, end_date)
+            
+            elif api_name == 'cn_cpi' or api_name == 'cpi':
+                df = ak.macro_china_cpi()
+                df = df.rename(columns={'月份': 'month', '全国-同比增长': 'cpi'})
+                return self._filter_by_date(df, 'month', start_date, end_date)
+
+            elif api_name == 'shibor':
+                df = ak.macro_china_shibor_all()
+                # 字段: 日期, 隔夜, 1周, 2周, 1个月, 3个月, 6个月, 9个月, 1年
+                df = df.rename(columns={'日期': 'date'})
+                return self._filter_by_date(df, 'date', start_date, end_date)
+
+            # --- 基础信息 ---
+            elif api_name == 'company_basic' or api_name == 'stock_company':
+                if not symbol: return None
+                try:
+                    # 获取个股异动/基本信息
+                    # ak.stock_individual_info_em(symbol="000001")
+                    df = ak.stock_individual_info_em(symbol=symbol)
+                    
+                    # 增加类型检查：如果返回标量，视为无效
+                    if isinstance(df, (str, int, float, bool)):
+                         logger.warning(f"stock_individual_info_em returned scalar: {df}")
+                         return None
+                    
+                    if df is not None and not df.empty:
+                        # stock_individual_info_em 返回两列: item, value
+                        # 转置为一行
+                        data = {}
+                        for _, row in df.iterrows():
+                            val = row['value']
+                            if pd.isna(val): val = None
+                            data[row['item']] = val
+                            
+                        df_ret = pd.DataFrame([data])
+                        
+                        # 映射字段
+                        col_map = {
+                            '股票代码': 'ts_code',
+                            '股票简称': 'name', 
+                            '总股本': 'total_share',
+                            '流通股': 'float_share',
+                            '总市值': 'total_mv',
+                            '流通市值': 'circ_mv',
+                            '行业': 'industry',
+                            '上市时间': 'list_date'
+                        }
+                        df_ret = df_ret.rename(columns=col_map)
+                        
+                        # 补充
+                        if 'ts_code' not in df_ret.columns: df_ret['ts_code'] = ts_code
+                        
+                        return df_ret
+                except Exception as e:
+                    logger.warning(f"Company basic info error: {e}")
+                    return None
+
+            # --- K线数据 (分钟) ---
+            elif api_name == 'stk_mins':
+                # 分钟线
+                if not symbol: return None
+                freq = kwargs.get('freq', '1min') # 1min, 5min, 15min, 30min, 60min
+                
+                # AKShare 分钟线接口需要带市场前缀 (如 sh600519)
+                market_prefix = self._get_market_prefix(ts_code)
+                symbol_with_market = f"{market_prefix}{symbol}"
+                
+                # AKShare 分钟线接口
+                # period: '1', '5', '15', '30', '60'
+                freq_map = {
+                    '1min': '1', '1m': '1',
+                    '5min': '5', '5m': '5',
+                    '15min': '15', '15m': '15',
+                    '30min': '30', '30m': '30',
+                    '60min': '60', '60m': '60'
+                }
+                period = freq_map.get(freq, '1')
+                
+                # 处理 adjust
+                adjust = kwargs.get('adj', '')
+                if adjust not in ['qfq', 'hfq']: adjust = ""
+                
+                try:
+                    df = ak.stock_zh_a_minute(symbol=symbol_with_market, period=period, adjust=adjust)
+                    if df is not None and not df.empty:
+                        # day, open, high, low, close, volume, amount, ...
+                        df = df.rename(columns={
+                            'day': 'trade_time', '时间': 'trade_time',
+                            'open': 'open', '开盘': 'open',
+                            'high': 'high', '最高': 'high',
+                            'low': 'low', '最低': 'low',
+                            'close': 'close', '收盘': 'close',
+                            'volume': 'vol', '成交量': 'vol',
+                            'amount': 'amount', '成交额': 'amount'
+                        })
+                        
+                        # 过滤时间
+                        if 'trade_time' in df.columns:
+                            # 统一格式
+                            df['trade_time'] = pd.to_datetime(df['trade_time'])
+                            
+                            if start_date:
+                                # start_date 可能是 "2023-01-01 09:30:00"
+                                s_dt = pd.to_datetime(start_date)
+                                df = df[df['trade_time'] >= s_dt]
+                            if end_date:
+                                e_dt = pd.to_datetime(end_date)
+                                df = df[df['trade_time'] <= e_dt]
+                                
+                            # 转回字符串
+                            df['trade_time'] = df['trade_time'].dt.strftime('%Y-%m-%d %H:%M:%S')
+                            
+                        return df
+                except Exception as e:
+                    logger.warning(f"AKShare minute data failed: {e}")
+                    return None
+
+            # --- 新闻数据 ---
+            elif api_name == 'news' or api_name == 'major_news':
+                # 个股新闻查询支持 (仅针对 'news' 接口，避免 major_news 递归)
+                query_term = kwargs.get('query', '') or kwargs.get('q', '')
+                if api_name == 'news' and query_term and (query_term.isdigit() or (len(query_term) == 9 and query_term[0].isdigit())):
+                    # 如果是股票代码，尝试获取个股新闻
+                    logger.info(f"AKShare fetching individual stock news for: {query_term}")
+                    return self.get_news(code=query_term, include_announcements=False)
+
+                # 7x24小时财经快讯
+                try:
+                    # 如果没有指定 symbol，则获取全球快讯
+                    if not symbol:
+                        # 使用财联社电报 (全球快讯)
+                        df = ak.stock_info_global_cls()
+                        if df is not None and not df.empty:
+                            # 字段: 标题, 内容, 发布时间, 发布日期
+                            df = df.rename(columns={
+                                '标题': 'title',
+                                '内容': 'content',
+                                '发布时间': 'time',
+                                '发布日期': 'date'
+                            })
+                            
+                            # 构造 datetime
+                            if 'datetime' not in df.columns:
+                                # 确保 date 和 time 是字符串
+                                if 'date' in df.columns:
+                                    df['date'] = df['date'].astype(str)
+                                if 'time' in df.columns:
+                                    df['time'] = df['time'].astype(str)
+                                    
+                                if 'date' in df.columns and 'time' in df.columns:
+                                    df['datetime'] = df['date'] + ' ' + df['time']
+                                elif 'date' in df.columns:
+                                    df['datetime'] = df['date']
+    
+                            # 兼容 Tushare 字段
+                            df['source'] = 'cls'
+                            df['type'] = 'news'
+                            
+                            logger.info(f"Global news fetched: {len(df)} rows. Filtering {start_date}-{end_date}")
+                            
+                            # 过滤关键词 (query)
+                            query_term = kwargs.get('query', '') or kwargs.get('q', '')
+                            if query_term:
+                                logger.info(f"Filtering news by query: {query_term}")
+                                # Filter if title or content contains query_term
+                                mask = df['title'].astype(str).str.contains(query_term, case=False, na=False) | \
+                                       df['content'].astype(str).str.contains(query_term, case=False, na=False)
+                                df = df[mask]
+                            
+                            # 过滤
+                            if start_date:
+                                try:
+                                    s_dt = pd.to_datetime(start_date)
+                                    df['dt_obj'] = pd.to_datetime(df['datetime'])
+                                    df = df[df['dt_obj'] >= s_dt]
+                                except Exception as e:
+                                    logger.warning(f"News start date filter error: {e}")
+                            
+                            if end_date:
+                                try:
+                                    e_dt = pd.to_datetime(end_date)
+                                    if 'dt_obj' not in df.columns:
+                                         df['dt_obj'] = pd.to_datetime(df['datetime'])
+                                    df = df[df['dt_obj'] <= e_dt]
+                                except Exception as e:
+                                    logger.warning(f"News end date filter error: {e}")
+                            
+                            logger.info(f"Global news after filter: {len(df)} rows")
+                            
+                            if 'dt_obj' in df.columns:
+                                del df['dt_obj']
+                                
+                            limit = kwargs.get('limit', 100)
+                            return df.head(limit)
+                        else:
+                            logger.warning("AKShare CLS news returned empty.")
+                            return None
+                    
+                    # 如果有 symbol，获取个股新闻
+                    else:
+                        # df = ak.stock_news_em(symbol=symbol) # Interface broken
+                        df = self._fetch_stock_news_em_custom(symbol=symbol)
+                        
+                        if df is not None and not df.empty:
+                            # 东方财富新闻字段: 关键词, 标题, 来源, 发布时间, 文章链接
+                            # Custom method already returns standardized columns: title, datetime, url, source, code
+                            # So we don't need rename if we match the keys
+                            
+                            # Original rename was:
+                            # df = df.rename(columns={
+                            #    '标题': 'title', 
+                            #    '发布时间': 'datetime', 
+                            #    '文章链接': 'url',
+                            #    '来源': 'source'
+                            # })
+                            
+                            # The custom method returns columns: title, url, datetime, source, code
+                            # So no rename needed.
+                            
+                            # 过滤
+                            if start_date:
+                                df = df[df['datetime'] >= start_date]
+                            if end_date:
+                                df = df[df['datetime'] <= end_date]
+                            
+                            return df.head(kwargs.get('limit', 50))
+                        
+                except Exception as e:
+                    logger.warning(f"AKShare news failed: {e}")
+                    return None
+
+            # --- 美股数据 ---
+            elif api_name == 'us_daily':
+                if not symbol: return None
+                # ak.stock_us_daily 需要 symbol="AAPL"
+                # 注意：Tushare 和 AKShare 美股代码格式可能一致
+                df = ak.stock_us_daily(symbol=symbol, adjust="qfq")
+                if df is not None and not df.empty:
+                    df = df.rename(columns={
+                        'date': 'trade_date', '日期': 'trade_date',
+                        'open': 'open', 'high': 'high', 'low': 'low', 'close': 'close',
+                        'volume': 'vol', 'amount': 'amount'
+                    })
+                    return self._filter_by_date(df, 'trade_date', start_date, end_date)
+
+            elif api_name in ['us_income', 'us_balancesheet', 'us_cashflow', 'us_fina_indicator']:
+                if not symbol: return None
+                # 使用新浪美股财务
+                try:
+                    sheet_map = {
+                        'us_income': '利润表',
+                        'us_balancesheet': '资产负债表',
+                        'us_cashflow': '现金流量表',
+                        'us_fina_indicator': '财务指标'
+                    }
+                    
+                    try:
+                        df = ak.stock_financial_report_sina(stock=symbol, symbol=sheet_map[api_name])
+                    except Exception as inner_e:
+                        logger.warning(f"AKShare stock_financial_report_sina failed for {symbol}: {inner_e}")
+                        df = None
+                    
+                    if df is None or df.empty:
+                        logger.warning(f"AKShare US financial data empty for {symbol} ({api_name})")
+                        return None
+                        
+                    # 字段映射需要根据实际返回调整，这里做通用处理
+                    # AKShare 新浪接口通常返回中文列名
+                    # 简单返回，让上层处理或后续完善映射
+                    return df
+                except Exception as e:
+                    logger.error(f"AKShare US financial error ({api_name}): {e}")
+                    return None
+
+            # --- 宏观经济数据 (补充) ---
+            elif api_name == 'cn_ppi' or api_name == 'ppi':
+                df = ak.macro_china_ppi()
+                df = df.rename(columns={'月份': 'month', '工业生产者出厂价格指数-同比增长': 'ppi'})
+                return self._filter_by_date(df, 'month', start_date, end_date)
+            
+            elif api_name == 'cn_m' or api_name == 'money_supply':
+                df = ak.macro_china_money_supply()
+                df = df.rename(columns={'月份': 'month', '货币和准货币(M2)-数量(亿元)': 'm2', '货币和准货币(M2)-同比增长': 'm2_yoy'})
+                return self._filter_by_date(df, 'month', start_date, end_date)
+
+            elif api_name == 'cn_pmi':
+                df = ak.macro_china_pmi()
+                df = df.rename(columns={'月份': 'month', '制造业PMI': 'pmi'})
+                return self._filter_by_date(df, 'month', start_date, end_date)
+            
+            elif api_name == 'cn_sf':
+                # 社会融资规模
+                df = ak.macro_china_shrzgm()
+                df = df.rename(columns={'月份': 'month', '社会融资规模增量': 'sf_month'})
+                return self._filter_by_date(df, 'month', start_date, end_date)
+
+            elif api_name == 'lpr_data':
+                df = ak.macro_china_lpr()
+                df = df.rename(columns={'日期': 'trade_date', '1年期LPR': '1y', '5年期以上LPR': '5y'})
+                return self._filter_by_date(df, 'trade_date', start_date, end_date)
+
+            # --- 指数数据 ---
+            elif api_name == 'index_daily':
+                if not symbol: return None
+                # 指数日线
+                # symbol 如 "sh000001"
+                market_prefix = self._get_market_prefix(ts_code)
+                idx_symbol = f"{market_prefix}{symbol}"
+                df = ak.stock_zh_index_daily(symbol=idx_symbol)
+                if df is not None:
+                     df = df.rename(columns={'date': 'trade_date', 'volume': 'vol'})
+                     return self._filter_by_date(df, 'trade_date', start_date, end_date)
+
+
+
+            # --- 资金流向 ---
+            elif api_name == 'moneyflow_dc' or api_name == 'stock_individual_fund_flow':
+                # 个股资金流
+                if not symbol: return None
+                try:
+                    # ak.stock_individual_fund_flow 可能需要 market 参数
+                    market = self._get_market_prefix(ts_code)
+                    logger.info(f"Fetching moneyflow for {symbol} market={market}")
+                    
+                    # AKShare 资金流向接口通常返回最近120天左右的数据，不支持直接传日期范围过滤 API 调用
+                    # 只能获取后在内存过滤
+                    df = ak.stock_individual_fund_flow(stock=symbol, market=market)
+                    if df is None or df.empty:
+                        logger.warning(f"Moneyflow returned empty for {symbol}")
+                        return None
+                        
+                    # 适配 Tushare 字段
+                    df = df.rename(columns={
+                        '日期': 'trade_date', 
+                        '主力净流入-净额': 'net_mf_amount',
+                        '超大单净流入-净额': 'net_large_amount',
+                        '大单净流入-净额': 'net_med_amount',
+                        '中单净流入-净额': 'net_small_amount',
+                        '小单净流入-净额': 'net_little_amount'
+                    })
+                    
+                    # 确保 trade_date 是字符串格式
+                    if 'trade_date' in df.columns:
+                        df['trade_date'] = df['trade_date'].apply(lambda x: str(x).split(' ')[0] if x else '')
+                        
+                    return self._filter_by_date(df, 'trade_date', start_date, end_date)
+                except Exception as e:
+                    logger.warning(f"AKShare moneyflow error: {e}")
+                    return None
+
+            # --- 财务数据 ---
+            elif api_name in ['income', 'balancesheet', 'cashflow', 'hk_income', 'hk_balancesheet', 'hk_cashflow']:
+                if not symbol: return None
+                
+                is_hk = 'hk_' in api_name or (ts_code and ts_code.endswith('.HK'))
+                
+                try:
+                    if is_hk:
+                        # 港股财务
+                        # AKShare 新浪接口通常使用 5 位数字代码，如 "00700"
+                        # ts_code 可能是 "00700.HK"
+                        hk_symbol = symbol
+                        if symbol.isdigit():
+                             hk_symbol = str(int(symbol)).zfill(5)
+                        
+                        if api_name == 'hk_income':
+                             try:
+                                 df = ak.stock_financial_report_sina(stock=hk_symbol, symbol="利润表")
+                             except Exception as e:
+                                 logger.warning(f"AKShare Sina HK income failed: {e}")
+                                 df = None
+                                 
+                             # 如果为空，尝试使用年度指标作为 fallback
+                             if df is None or df.empty:
+                                try:
+                                    logger.info(f"Using fallback analysis indicator for {hk_symbol}")
+                                    df = ak.stock_financial_hk_analysis_indicator_em(symbol=hk_symbol, indicator="年度")
+                                    if df is not None:
+                                         # 映射字段
+                                         df = df.rename(columns={
+                                             'REPORT_DATE': 'end_date',
+                                             'OPERATE_INCOME': 'total_revenue',
+                                             'HOLDER_PROFIT': 'n_income',
+                                             'BASIC_EPS': 'basic_eps',
+                                             'ROE_AVG': 'roe'
+                                         })
+                                         # 添加缺失字段
+                                         if 'ann_date' not in df.columns and 'end_date' in df.columns:
+                                             df['ann_date'] = df['end_date']
+                                         
+                                         logger.info(f"Fallback HK analysis data: {len(df)} rows. Columns: {df.columns.tolist()}")
+                                except Exception as e:
+                                    logger.warning(f"Fallback HK analysis error: {e}")
+                                    pass
+                        elif api_name == 'hk_balancesheet':
+                            try:
+                                df = ak.stock_financial_report_sina(stock=hk_symbol, symbol="资产负债表")
+                            except Exception:
+                                df = None
+                        elif api_name == 'hk_cashflow':
+                            try:
+                                df = ak.stock_financial_report_sina(stock=hk_symbol, symbol="现金流量表")
+                            except Exception:
+                                df = None
+                        else:
+                            df = None
+                        
+                        # 新浪返回的列名通常是中文，需要映射
+                        if df is not None and not df.empty:
+                            # 简单列名映射尝试
+                            # 利润表: 截止日期, 营业收入, 净利润...
+                            # 资产负债表: 截止日期, 资产总计, 负债总计...
+                            col_map = {
+                                '截止日期': 'end_date',
+                                '营业收入': 'revenue',
+                                '净利润': 'n_income',
+                                '资产总计': 'total_assets',
+                                '负债总计': 'total_liab',
+                                '经营活动现金流量净额': 'n_cashflow_act'
+                            }
+                            df = df.rename(columns=col_map)
+                            # 确保有 ann_date (用 end_date 填充)
+                            if 'end_date' in df.columns and 'ann_date' not in df.columns:
+                                df['ann_date'] = df['end_date']
+                    else:
+                        # A股财务 (东方财富接口需要带市场标识的 symbol，如 SZ000001)
+                        em_symbol = self._to_em_symbol(ts_code)
+                        logger.info(f"Fetching financial data ({api_name}) for {em_symbol}")
+                        
+                        if api_name == 'income':
+                            df = ak.stock_profit_sheet_by_quarterly_em(symbol=em_symbol)
+                            # 利润表映射
+                            if df is not None:
+                                df = df.rename(columns={
+                                    'NOTICE_DATE': 'ann_date',
+                                    'REPORT_DATE': 'end_date',
+                                    'BASIC_EPS': 'basic_eps',
+                                    'TOTAL_PROFIT': 'total_profit',
+                                    'NETPROFIT': 'n_income',
+                                    'OPERATE_INCOME': 'total_revenue', # 银行等金融类
+                                    'TOTAL_OPERATE_INCOME': 'total_revenue', # 一般企业
+                                    'OPERATE_PROFIT': 'op_income'
+                                })
+                        elif api_name == 'balancesheet':
+                            # 资产负债表：注意使用 by_report 接口
+                            df = ak.stock_balance_sheet_by_report_em(symbol=em_symbol)
+                            if df is not None:
+                                df = df.rename(columns={
+                                    'NOTICE_DATE': 'ann_date',
+                                    'REPORT_DATE': 'end_date',
+                                    'TOTAL_ASSETS': 'total_assets',
+                                    'TOTAL_LIABILITIES': 'total_liab',
+                                    'TOTAL_EQUITY': 'total_hldr_eqy_exc_min_int', # 近似
+                                    'SHARE_CAPITAL': 'total_share',
+                                    'MONETARYFUNDS': 'money_cap', # 一般企业
+                                })
+                        elif api_name == 'cashflow':
+                            df = ak.stock_cash_flow_sheet_by_quarterly_em(symbol=em_symbol)
+                            if df is not None:
+                                df = df.rename(columns={
+                                    'NOTICE_DATE': 'ann_date',
+                                    'REPORT_DATE': 'end_date',
+                                    'NETPROFIT': 'net_profit',
+                                    'TOTAL_OPERATE_INFLOW': 'c_inf_fr_operate_a',
+                                    'TOTAL_OPERATE_OUTFLOW': 'c_out_fr_operate_a',
+                                    'NETCASH_OPERATE': 'n_cashflow_act',
+                                    'NETCASH_INVEST': 'n_cashflow_inv_act',
+                                    'NETCASH_FINANCE': 'n_cashflow_fina_act',
+                                    'CCE_ADD': 'n_incr_cash_cash_equ'
+                                })
+                        else:
+                            df = None
+                    
+                    if df is not None and not df.empty:
+                        # 通用清理：日期格式 "YYYY-MM-DD 00:00:00" -> "YYYYMMDD" (Tushare format)
+                        for col in ['ann_date', 'end_date']:
+                            if col in df.columns:
+                                df[col] = df[col].astype(str).apply(lambda x: x.split(' ')[0].replace('-', '') if x and x != 'nan' else '')
+                        
+                        # 添加 ts_code
+                        if 'ts_code' not in df.columns and ts_code:
+                            df['ts_code'] = ts_code
+                            
+                        # 尝试找到日期列进行过滤
+                        date_col = 'end_date' if 'end_date' in df.columns else ('ann_date' if 'ann_date' in df.columns else None)
+                        if date_col:
+                            return self._filter_by_date(df, date_col, start_date, end_date)
+                        return df
+                    else:
+                        logger.warning(f"Financial data empty for {symbol} ({api_name})")
+                        return None
+                except Exception as e:
+                    logger.error(f"AKShare financial data error ({api_name}): {e}")
+                    return None
+
+            # --- 基金数据 ---
+            elif api_name == 'fund_basic':
+                # 基金列表
+                try:
+                    df = None
+                    # 尝试多种接口
+                    for func_name in ['fund_name_em', 'fund_em_fund_name', 'fund_open_fund_daily_em']:
+                        if hasattr(ak, func_name):
+                            try:
+                                df = getattr(ak, func_name)()
+                                if df is not None and not df.empty:
+                                    break
+                            except:
+                                pass
+                             
+                    if df is not None:
+                         # 统一重命名
+                         rename_map = {'基金代码': 'ts_code', '基金简称': 'name', '基金类型': 'fund_type'}
+                         df = df.rename(columns=rename_map)
+                         return df.head(100) # 限制返回数量
+                except Exception as e:
+                    logger.error(f"Fund basic error: {e}")
+                    return None
+            
+            elif api_name == 'fund_nav':
+                # 基金净值
+                if not symbol: return None
+                try:
+                    logger.info(f"Fetching fund nav for {symbol}")
+                    # API 变更为 symbol 参数
+                    df = ak.fund_open_fund_info_em(symbol=symbol, indicator="单位净值走势")
+                    if df is None or df.empty:
+                        logger.warning(f"Fund nav empty for {symbol}")
+                        return None
+                    df = df.rename(columns={'净值日期': 'nav_date', '单位净值': 'unit_nav', '日增长率': 'adj_nav'})
+                    return self._filter_by_date(df, 'nav_date', start_date, end_date)
+                except Exception as e:
+                    logger.error(f"Fund nav error: {e}")
+                    return None
+
+            elif api_name == 'fund_portfolio':
+                # 基金持仓
+                if not symbol: return None
+                try:
+                    # ak.fund_portfolio_hold_em(symbol="000001", date="2021")
+                    # 这里简化，获取最新持仓
+                    df = ak.fund_portfolio_hold_em(symbol=symbol)
+                    if df is not None:
+                        df = df.rename(columns={'股票代码': 'symbol', '股票名称': 'name', '占净值比例': 'stk_mkv_ratio'})
+                        return df
+                except Exception as e:
+                     logger.warning(f"Fund portfolio error: {e}")
+                     return None
+            
+
+
+
+
+            elif api_name == 'top_inst':
+                # 龙虎榜机构成交
+                try:
+                    date_str = kwargs.get('trade_date', '').replace('-', '')
+                    if not date_str: 
+                        if start_date:
+                            date_str = start_date.replace('-', '')
+                        else:
+                            date_str = self.find_latest_trade_date()
+                    
+                    # stock_lhb_detail_em 需要 start_date 和 end_date
+                    # 如果只查一天，则 start=end
+                    s_date = date_str
+                    e_date = date_str
+                    if start_date and end_date:
+                        s_date = start_date.replace('-', '')
+                        e_date = end_date.replace('-', '')
+                        
+                    df = ak.stock_lhb_detail_em(start_date=s_date, end_date=e_date)
+                    if df is not None:
+                         df = df.rename(columns={'代码': 'ts_code', '名称': 'name', '上榜原因': 'reason', '交易日期': 'trade_date'})
+                         return df
+                except Exception as e:
+                     logger.warning(f"Dragon tiger error: {e}")
+                     return None
+
+            elif api_name == 'block_trade':
+                # 大宗交易
+                try:
+                    # stock_dzjy_mrtj 每日统计，可能不需要参数获取最近，或需要 start_date/end_date
+                    s_date = start_date.replace('-', '') if start_date else self.find_latest_trade_date()
+                    e_date = end_date.replace('-', '') if end_date else s_date
+                    
+                    try:
+                        df = ak.stock_dzjy_mrtj(start_date=s_date, end_date=e_date)
+                    except TypeError:
+                         # 如果不支持日期参数，尝试无参调用（通常返回最近交易日）
+                         df = ak.stock_dzjy_mrtj()
+                         
+                    if df is not None:
+                         df = df.rename(columns={'证券代码': 'ts_code', '证券简称': 'name', '成交价': 'price', '成交量': 'vol', '成交额': 'amount', '交易日期': 'trade_date'})
+                         return df
+                except Exception as e:
+                     logger.warning(f"Block trade error: {e}")
+                     return None
+
+            # --- 可转债 ---
+            elif api_name == 'cb_basic' or api_name == 'cb_issue':
+                try:
+                    # 尝试多种接口
+                    df = None
+                    for func_name in ['bond_zh_cov_spot_em', 'bond_zh_hs_cov_spot', 'bond_zh_cov_spot']:
+                        if hasattr(ak, func_name):
+                            try:
+                                df = getattr(ak, func_name)()
+                                if df is not None and not df.empty:
+                                    break
+                            except:
+                                pass
+                        
+                    if df is not None:
+                        df = df.rename(columns={'代码': 'ts_code', '名称': 'name', '最新价': 'price'})
+                        return df
+                except Exception as e:
+                     logger.warning(f"Convertible bond error: {e}")
+                     return None
+            
+            # --- 融资融券明细 ---
+            elif api_name == 'margin_detail':
+                # 确定日期：优先使用 end_date，如果没有则使用 start_date，如果没有则使用昨天
+                query_date = end_date or start_date or self.find_latest_trade_date()
+                query_date = query_date.replace('-', '')
+                
+                df_list = []
+                try:
+                    df_sz = ak.stock_margin_detail_szse(date=query_date)
+                    if df_sz is not None and not df_sz.empty:
+                        # 预先重命名
+                        df_sz = df_sz.rename(columns={
+                            '证券代码': 'ts_code', '证券简称': 'name', 
+                            '融资买入额': 'rzmre', '融资余额': 'rzye', 
+                            '融券卖出量': 'rqmcl', '融券余量': 'rqyl', 
+                            '融券余额': 'rqye', '融资融券余额': 'rzrqye'
+                        })
+                        df_list.append(df_sz)
+                except: pass
+                
+                try:
+                    df_sh = ak.stock_margin_detail_sse(date=query_date)
+                    if df_sh is not None and not df_sh.empty:
+                        # 预先重命名
+                        df_sh = df_sh.rename(columns={
+                            '标的证券代码': 'ts_code', '标的证券简称': 'name',
+                            '融资买入额': 'rzmre', '融资偿还额': 'rzche', '融资余额': 'rzye',
+                            '融券卖出量': 'rqmcl', '融券偿还量': 'rqchl', '融券余量': 'rqyl', '融券余额': 'rqye',
+                            '信用交易日期': 'trade_date'
+                        })
+                        df_list.append(df_sh)
+                except: pass
+                
+                if df_list:
+                    df = pd.concat(df_list, ignore_index=True)
+                    # 补全日期
+                    if 'trade_date' not in df.columns:
+                        df['trade_date'] = query_date
+                    # 过滤
+                    if ts_code:
+                        code_no_suffix = ts_code.split('.')[0]
+                        df = df[df['ts_code'] == code_no_suffix]
+                    return df
+                return None
+
+            # --- 基金经理 ---
+            elif api_name == 'fund_manager':
+                try:
+                    df = ak.fund_manager_em()
+                    name = kwargs.get('name', '')
+                    logger.info(f"Fund Manager Search: '{name}', Total records: {len(df) if df is not None else 0}")
+                    
+                    if name:
+                        # 尝试精确匹配
+                        df_filtered = df[df['姓名'] == name]
+                        logger.info(f"Exact match count: {len(df_filtered)}")
+                        
+                        if df_filtered.empty:
+                            # 尝试模糊匹配
+                            df_filtered = df[df['姓名'].astype(str).str.contains(name, na=False)]
+                            logger.info(f"Fuzzy match count: {len(df_filtered)}")
+                        
+                        return df_filtered
+                    return df
+                except Exception as e:
+                    logger.warning(f"AKShare fund_manager error: {e}")
+                    return None
+
+            # --- 指数成分股权重 ---
+            elif api_name == 'index_weight':
+                index_code = kwargs.get('index_code', '')
+                symbol = index_code.split('.')[0]
+                logger.info(f"Index Weight Search: {index_code} -> {symbol}")
+                
+                # 尝试中证指数官网接口 (通常更准确，但需要 openpyxl)
+                try:
+                    logger.info("Trying csindex interface...")
+                    df = ak.index_stock_cons_weight_csindex(symbol=symbol)
+                    logger.info(f"csindex success, records: {len(df)}")
+                    df = df.rename(columns={
+                        '日期': 'trade_date',
+                        '指数代码': 'index_code',
+                        '成分券代码': 'con_code',
+                        '权重': 'weight'
+                    })
+                    return df
+                except Exception as e:
+                    logger.warning(f"AKShare index_weight (csindex) failed: {e}, trying fallback...")
+                
+                # 回退：新浪接口
+                try:
+                    logger.info("Trying sina interface...")
+                    df = ak.index_stock_cons_sina(symbol=symbol)
+                    logger.info(f"sina success, records: {len(df)}")
+                    # 新浪接口返回: symbol, name, pub_date
+                    # 注意：新浪接口可能不包含权重，只包含成分股列表
+                    # 列名: 代码, 名称
+                    df = df.rename(columns={'代码': 'con_code', '名称': 'con_name'})
+                    df['index_code'] = symbol
+                    df['weight'] = 0  # 新浪接口无权重数据
+                    df['trade_date'] = datetime.now().strftime("%Y%m%d")
+                    return df
+                except Exception as e:
+                    logger.warning(f"AKShare index_weight (sina) failed: {e}")
+                    return None
+
+            # --- 其他 ---
+            elif api_name == 'daily' or api_name == 'hk_daily':
+                # 日线行情 (fallback for get_stock_data)
+                if not symbol: return None
+                
+                if api_name == 'hk_daily':
+                     df = ak.stock_hk_daily(symbol=symbol, adjust="qfq")
+                else:
+                     s_date = start_date.replace('-','') if start_date else "19900101"
+                     e_date = end_date.replace('-','') if end_date else datetime.now().strftime("%Y%m%d")
+                     df = ak.stock_zh_a_hist(symbol=symbol, start_date=s_date, end_date=e_date, adjust="qfq")
+                
+                if df is not None and not df.empty:
+                    df = df.rename(columns={
+                        '日期': 'trade_date', 'date': 'trade_date',
+                        '开盘': 'open', '收盘': 'close', 
+                        '最高': 'high', '最低': 'low', 
+                        '成交量': 'vol', 'volume': 'vol',
+                        '成交额': 'amount',
+                        '涨跌幅': 'pct_chg', '涨跌额': 'change', 
+                        '换手率': 'turnover'
+                    })
+                    # 添加 price 字段兼容
+                    if 'close' in df.columns:
+                        df['price'] = df['close']
+                    return df
+
+            logger.warning(f"AKShare query: API {api_name} not implemented or failed mapping.")
+            return None
+            
+        except Exception as e:
+            logger.error(f"AKShare query failed for {api_name}: {e}")
+            return None
+
+    def _filter_by_date(self, df, date_col, start_date, end_date):
+        if df is None or df.empty: return df
+        try:
+            # 统一转为 datetime
+            df[date_col] = pd.to_datetime(df[date_col])
+            
+            if start_date:
+                s_date = pd.to_datetime(start_date)
+                df = df[df[date_col] >= s_date]
+            if end_date:
+                e_date = pd.to_datetime(end_date)
+                df = df[df[date_col] <= e_date]
+                
+            # 转回字符串以便显示
+            df[date_col] = df[date_col].dt.strftime('%Y-%m-%d')
+            return df
+        except:
+            return df
+
+    def _get_market_prefix(self, ts_code):
+        if not ts_code: return "sh"
+        if ts_code.endswith('.SH'): return "sh"
+        if ts_code.endswith('.SZ'): return "sz"
+        if ts_code.endswith('.BJ'): return "bj"
+        return "sh" # default
+
     def get_kline(self, code: str, period: str = "day", limit: int = 120, adj: Optional[str] = None):
         """AKShare K-line as fallback. Try daily/week/month via stock_zh_a_hist; minutes via stock_zh_a_minute."""
         if not self.is_available():
@@ -350,21 +1265,29 @@ class AKShareAdapter(DataSourceAdapter):
             import akshare as ak
             code6 = str(code).zfill(6)
             items = []
-            # news
+            
+            # Note: stock_news_em interface is currently unstable/broken (dynamic callback issue + empty data)
+            # We skip the direct individual stock news call to avoid errors and rely on global news search fallback.
+            
+            # Fallback: Search in global news
             try:
-                dfn = ak.stock_news_em(symbol=code6)
-                if dfn is not None and not dfn.empty:
-                    for _, row in dfn.head(limit).iterrows():
-                        items.append({
-                            # AkShare 将字段标准化为中文列名：新闻标题 / 文章来源 / 发布时间 / 新闻链接
-                            "title": str(row.get('新闻标题') or row.get('标题') or row.get('title') or ''),
-                            "source": str(row.get('文章来源') or row.get('来源') or row.get('source') or 'akshare'),
-                            "time": str(row.get('发布时间') or row.get('time') or ''),
-                            "url": str(row.get('新闻链接') or row.get('url') or ''),
-                            "type": "news",
-                        })
-            except Exception:
-                pass
+                # 使用 major_news 避免递归调用 get_news
+                # 尝试放宽搜索条件
+                df_global = self.query("major_news", query=code6, limit=limit)
+                if df_global is not None and not df_global.empty:
+                     # query("news") 已经做了字段标准化
+                     # df_global: title, content, datetime, source, type
+                     for _, row in df_global.iterrows():
+                         items.append({
+                             "title": str(row.get('title', '')),
+                             "content": str(row.get('content', '')), # global news has content
+                             "source": str(row.get('source', 'akshare')),
+                             "time": str(row.get('datetime', '')),
+                             "type": "news"
+                         })
+            except Exception as e:
+                logger.warning(f"Global news search failed for {code6}: {e}")
+            
             # announcements
             try:
                 if include_announcements:

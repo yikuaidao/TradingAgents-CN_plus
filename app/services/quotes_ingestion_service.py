@@ -8,7 +8,7 @@ from pymongo import UpdateOne
 
 from app.core.config import settings
 from app.core.database import get_mongo_db
-from app.services.data_sources.manager import DataSourceManager
+from tradingagents.dataflows.manager import DataSourceManager
 
 logger = logging.getLogger(__name__)
 

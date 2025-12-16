@@ -117,7 +117,27 @@ def get_stock_fundamentals(
             # 港股
             logger.info(f"🇭🇰 [MCP基本面工具] 处理港股数据...")
             
-            allow_full_fetch = data_depth in ["full", "comprehensive"]
+            # 1. 获取基础信息
+            try:
+                from tradingagents.dataflows.interface import get_hk_stock_info_unified
+                hk_info = get_hk_stock_info_unified(ticker)
+                
+                basic_info = f"""## 港股基础信息
+
+**股票代码**: {ticker}
+**股票名称**: {hk_info.get('name', f'港股{ticker}')}
+**交易货币**: 港币 (HK$)
+**交易所**: 香港交易所 (HKG)
+**行业**: {hk_info.get('industry', '未知')}
+**上市日期**: {hk_info.get('list_date', '未知')}
+"""
+                result_data.append(basic_info)
+            except Exception as e:
+                logger.warning(f"⚠️ [MCP基本面工具] 港股基础信息获取失败: {e}")
+                result_data.append(f"## 港股基础信息\n⚠️ 获取失败: {e}")
+
+            # 2. 获取行情数据 (如果需要)
+            allow_full_fetch = data_depth in ["standard", "full", "comprehensive"]
             
             if allow_full_fetch:
                 try:
@@ -125,30 +145,14 @@ def get_stock_fundamentals(
                     hk_data = get_hk_stock_data_unified(ticker, start_date, end_date)
                     
                     if hk_data and len(hk_data) > 100 and "❌" not in hk_data:
-                        result_data.append(f"## 港股数据\n{hk_data}")
+                        result_data.append(f"## 港股行情数据\n{hk_data}")
                     else:
                         raise ValueError("港股数据质量不佳")
                 except Exception as e:
-                    logger.warning(f"⚠️ [MCP基本面工具] 港股主要数据源失败: {e}")
-                    # 使用备用方案
-                    try:
-                        from tradingagents.dataflows.interface import get_hk_stock_info_unified
-                        hk_info = get_hk_stock_info_unified(ticker)
-                        
-                        basic_info = f"""## 港股基础信息
-
-**股票代码**: {ticker}
-**股票名称**: {hk_info.get('name', f'港股{ticker}')}
-**交易货币**: 港币 (HK$)
-**交易所**: 香港交易所 (HKG)
-
-⚠️ 注意：详细的财务数据暂时无法获取，建议稍后重试。
-"""
-                        result_data.append(basic_info)
-                    except Exception as e2:
-                        result_data.append(f"## 港股信息\n⚠️ 数据获取失败: {e2}")
+                    logger.warning(f"⚠️ [MCP基本面工具] 港股行情数据获取失败: {e}")
+                    result_data.append(f"## 港股行情数据\n⚠️ 获取失败: {e}")
             else:
-                result_data.append(f"## 港股基础信息\n轻量模式：跳过详细数据抓取")
+                result_data.append(f"## 港股行情数据\n轻量模式：跳过详细数据抓取")
 
         else:
             # 美股

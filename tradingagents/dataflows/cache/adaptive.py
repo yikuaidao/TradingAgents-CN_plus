@@ -271,7 +271,7 @@ class AdaptiveCacheSystem:
         
         return cache_key
     
-    def load_data(self, cache_key: str) -> Optional[Any]:
+    def load_data(self, cache_key: str, max_age_hours: int = None) -> Optional[Any]:
         """从缓存加载数据"""
         cache_data = None
         
@@ -290,26 +290,38 @@ class AdaptiveCacheSystem:
         
         if not cache_data:
             return None
+            
+        # 检查自定义过期时间 (适用于所有后端)
+        if max_age_hours is not None:
+            age = datetime.now() - cache_data['timestamp']
+            if age.total_seconds() > max_age_hours * 3600:
+                self.logger.debug(f"缓存数据已超过自定义过期时间({max_age_hours}小时): {cache_key}")
+                return None
         
         # 检查缓存是否有效（仅对文件缓存，数据库缓存有自己的TTL机制）
         if cache_data.get('backend') == 'file':
             symbol = cache_data['metadata'].get('symbol', '')
             data_type = cache_data['metadata'].get('data_type', 'stock_data')
-            ttl_seconds = self._get_ttl_seconds(symbol, data_type)
             
-            if not self._is_cache_valid(cache_data['timestamp'], ttl_seconds):
-                self.logger.debug(f"文件缓存已过期: {cache_key}")
-                return None
+            # 仅当没有指定 max_age_hours 时才使用默认 TTL 检查
+            # (如果指定了 max_age_hours，上面已经检查过了)
+            if max_age_hours is None:
+                ttl_seconds = self._get_ttl_seconds(symbol, data_type)
+                
+                if not self._is_cache_valid(cache_data['timestamp'], ttl_seconds):
+                    self.logger.debug(f"文件缓存已过期: {cache_key}")
+                    return None
         
         return cache_data['data']
     
     def find_cached_data(self, symbol: str, start_date: str = "", end_date: str = "", 
-                        data_source: str = "default", data_type: str = "stock_data") -> Optional[str]:
+                        data_source: str = "default", data_type: str = "stock_data",
+                        max_age_hours: int = None) -> Optional[str]:
         """查找缓存的数据"""
         cache_key = self._get_cache_key(symbol, start_date, end_date, data_source, data_type)
         
         # 检查缓存是否存在且有效
-        if self.load_data(cache_key) is not None:
+        if self.load_data(cache_key, max_age_hours=max_age_hours) is not None:
             return cache_key
         
         return None

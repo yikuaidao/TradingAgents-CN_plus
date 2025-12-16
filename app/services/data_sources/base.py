@@ -67,3 +67,14 @@ class DataSourceAdapter(ABC):
     def get_news(self, code: str, days: int = 2, limit: int = 50, include_announcements: bool = True):
         """获取新闻/公告，返回 [{title, source, time, url, type}]，type in ['news','announcement']"""
         raise NotImplementedError
+
+    def query(self, api_name: str, **kwargs) -> Optional[pd.DataFrame]:
+        """
+        Generic query method for extended data types.
+        Args:
+            api_name: The name of the API/Interface (e.g. "fund_nav", "shibor").
+            **kwargs: Parameters for the query.
+        Returns:
+            pd.DataFrame or None if not supported/failed.
+        """
+        return None

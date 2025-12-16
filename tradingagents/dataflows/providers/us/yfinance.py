@@ -1,6 +1,10 @@
 # gets data/stats
 
-import yfinance as yf
+try:
+    import yfinance as yf
+except ImportError:
+    yf = None
+
 from typing import Annotated, Callable, Any, Optional
 from pandas import DataFrame
 import pandas as pd
@@ -39,6 +43,17 @@ def init_ticker(func: Callable) -> Callable:
 
     @wraps(func)
     def wrapper(symbol: Annotated[str, "ticker symbol"], *args, **kwargs) -> Any:
+        if yf is None:
+            logger.warning(f"❌ yfinance 未安装，无法获取 {symbol} 数据。请安装: pip install yfinance")
+            # 返回空 DataFrame 或其他合适的默认值，避免崩溃
+            if func.__name__ in ['get_stock_data', 'get_company_info', 'get_income_stmt', 'get_balance_sheet', 'get_cash_flow']:
+                return DataFrame()
+            elif func.__name__ == 'get_stock_info':
+                return {}
+            elif func.__name__ == 'get_analyst_recommendations':
+                return None, 0
+            return None
+
         ticker = yf.Ticker(symbol)
         return func(ticker, *args, **kwargs)
 
@@ -158,6 +173,9 @@ def get_stock_data_with_indicators(
         # 验证日期格式
         datetime.strptime(start_date, "%Y-%m-%d")
         datetime.strptime(end_date, "%Y-%m-%d")
+
+        if yf is None:
+            return "Error: yfinance library not installed. Please install with `pip install yfinance`."
 
         # 创建 ticker 对象
         ticker = yf.Ticker(symbol.upper())
@@ -303,6 +321,10 @@ def get_technical_indicator(
 
         # 获取股票数据
         logger.info(f"📊 [yfinance] 获取 {symbol} 技术指标 {indicator}，日期范围: {start_date} 至 {curr_date}")
+        
+        if yf is None:
+            return "❌ yfinance 未安装，无法获取数据"
+
         ticker = yf.Ticker(symbol.upper())
         data = ticker.history(start=start_date, end=curr_date)
 

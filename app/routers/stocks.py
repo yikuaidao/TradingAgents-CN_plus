@@ -532,7 +532,7 @@ async def get_kline(
         logger.info(f"📡 MongoDB 无数据，降级到外部 API")
         try:
             import asyncio
-            from app.services.data_sources.manager import DataSourceManager
+            from tradingagents.dataflows.manager import DataSourceManager
 
             mgr = DataSourceManager()
             # 添加 10 秒超时保护

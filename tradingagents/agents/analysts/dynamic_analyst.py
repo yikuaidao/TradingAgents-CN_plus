@@ -24,11 +24,26 @@ class DynamicAnalystFactory:
     def load_config(cls, config_path: str = None) -> Dict[str, Any]:
         """加载智能体配置文件"""
         if not config_path:
-            # 默认使用 tradingagents/agents/phase1_agents_config.yaml
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            # tradingagents/agents/analysts -> tradingagents/agents
-            agents_dir = os.path.dirname(current_dir)
-            config_path = os.path.join(agents_dir, "phase1_agents_config.yaml")
+            # 1. 优先使用环境变量 AGENT_CONFIG_DIR
+            env_dir = os.getenv("AGENT_CONFIG_DIR")
+            if env_dir and os.path.exists(env_dir):
+                config_path = os.path.join(env_dir, "phase1_agents_config.yaml")
+            else:
+                # 获取当前文件所在目录
+                current_dir = os.path.dirname(os.path.abspath(__file__))
+                # tradingagents/agents/analysts -> tradingagents/agents -> tradingagents -> root
+                project_root = os.path.dirname(os.path.dirname(os.path.dirname(current_dir)))
+                
+                # 2. 尝试使用 config/agents/phase1_agents_config.yaml
+                config_dir = os.path.join(project_root, "config", "agents")
+                config_path_candidate = os.path.join(config_dir, "phase1_agents_config.yaml")
+                
+                if os.path.exists(config_path_candidate):
+                    config_path = config_path_candidate
+                else:
+                    # 3. 回退到 tradingagents/agents/phase1_agents_config.yaml
+                    agents_dir = os.path.dirname(current_dir)
+                    config_path = os.path.join(agents_dir, "phase1_agents_config.yaml")
 
         try:
             mtime = os.path.getmtime(config_path)
@@ -359,6 +374,63 @@ class DynamicAnalystFactory:
 
         return enable_mcp, mcp_loader
 
+    @staticmethod
+    def _wrap_tool_safe(tool):
+        """
+        🛡️ 安全增强：包装工具以捕获异常，防止单个工具失败导致 Agent 崩溃。
+        返回错误信息字符串供 LLM 决策，而不是抛出异常。
+        """
+        # 同步方法包装
+        if hasattr(tool, "func") and callable(tool.func):
+            original_func = tool.func
+            def safe_func(*args, **kwargs):
+                try:
+                    # 🛡️ 兼容性增强：检测当前是否在 uvloop/asyncio 循环中
+                    # 如果工具内部可能调用 asyncio.run() (如 akshare/tushare 的某些接口)
+                    # 必须在独立线程中运行，否则会报错 "Can't patch loop of type uvloop.Loop"
+                    import asyncio
+                    try:
+                        # 检查是否有正在运行的循环
+                        loop = asyncio.get_running_loop()
+                        is_loop_running = True
+                    except RuntimeError:
+                        is_loop_running = False
+                    
+                    if is_loop_running:
+                        # 如果有循环运行（特别是 uvloop），则必须使用线程隔离
+                        from concurrent.futures import ThreadPoolExecutor
+                        # ⚠️ 使用 ThreadPoolExecutor 来运行同步函数
+                        # 这会创建一个新的线程，该线程没有默认的 event loop
+                        # 因此工具内部调用 asyncio.run() 会创建新的标准 loop，规避 uvloop 问题
+                        with ThreadPoolExecutor(max_workers=1) as executor:
+                            future = executor.submit(original_func, *args, **kwargs)
+                            # 等待结果（会阻塞当前协程，但这是同步工具的预期行为）
+                            return future.result()
+                    else:
+                        # 如果没有循环运行，直接调用
+                        return original_func(*args, **kwargs)
+
+                except Exception as e:
+                    # 捕获异常并返回友好的错误提示
+                    error_msg = f"❌ [系统提示] 工具 '{tool.name}' 调用失败: {str(e)}。\n👉 请不要停止分析！\n1. 如果有其他工具可用，请尝试其他工具。\n2. 如果无法解决，请在最终报告中明确记录此错误和失败原因。"
+                    logger.error(f"⚠️ [工具安全网] 捕获到工具异常: {tool.name} -> {e}")
+                    return error_msg
+            tool.func = safe_func
+        
+        # 异步方法包装 (如果有)
+        if hasattr(tool, "coroutine") and callable(tool.coroutine):
+            original_coro = tool.coroutine
+            async def safe_coro(*args, **kwargs):
+                try:
+                    return await original_coro(*args, **kwargs)
+                except Exception as e:
+                    error_msg = f"❌ [系统提示] 工具 '{tool.name}' (Async) 调用失败: {str(e)}。\n👉 请不要停止分析！\n1. 如果有其他工具可用，请尝试其他工具。\n2. 如果无法解决，请在最终报告中明确记录此错误和失败原因。"
+                    logger.error(f"⚠️ [工具安全网] 捕获到工具异常(Async): {tool.name} -> {e}")
+                    return error_msg
+            tool.coroutine = safe_coro
+            
+        return tool
+
     @classmethod
     def create_analyst(cls, slug: str, llm: Any, toolkit: Any, config_path: str = None) -> Callable:
         """
@@ -406,6 +478,10 @@ class DynamicAnalystFactory:
                     "⚠️ 工具裁剪后为空，回退到全量工具。"
                     "请确认配置的工具名称与注册名称一致。"
                 )
+        
+        # 🛡️ 安全增强：包装所有工具以捕获异常
+        # 这样即使单个工具崩溃，Agent 也能收到错误信息并继续执行
+        tools = [cls._wrap_tool_safe(tool) for tool in tools]
         
         # 实例化通用智能体
         agent = GenericAgent(

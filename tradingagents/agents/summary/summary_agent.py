@@ -39,7 +39,7 @@ def create_summary_agent(llm):
 
 ⚠️ 严格要求：
 1. **只输出纯 JSON**，不要包含 markdown 代码块（如 ```json ... ```），不要包含任何解释性文字。
-2. **所有字段必须存在**，如果无法从文本中提取，请根据上下文进行合理估算或填入默认值（如 0 或 "N/A"）。
+2. **真实性检查**：如果输入的分析报告（analysis reports）内容为空，或者包含明显的"工具调用失败"、"获取数据失败"等错误信息，请务必在 `risk_assessment.description` 中如实说明“数据获取失败，无法生成报告”，并将 `model_confidence` 设为 0。**严禁在缺乏数据的情况下编造数值或建议**。
 3. **数值类型**必须是数字（int/float），不要用字符串。
 4. **纯文本输出**：`analysis_summary` 和 `investment_recommendation` 字段必须是纯文本，**严禁使用 Markdown 格式**（如 **加粗**、## 标题等），确保前端显示整洁。
 
@@ -58,8 +58,8 @@ JSON 结构定义如下：
         "score": 0-10之间的评分 (float),
         "description": "简短的风险描述 (string)"
     }},
-    "analysis_summary": "200字以内的分析摘要，纯文本格式，简明扼要地总结核心逻辑和多空观点 (string)",
-    "investment_recommendation": "200字以内的投资建议，纯文本格式，给出明确的操作指令（买入/卖出/观望）和核心理由 (string)",
+    "analysis_summary": "200字以内的分析摘要，纯文本格式，简明扼要地总结核心逻辑和多空观点 (string)。如果无数据，请填'数据获取失败'。",
+    "investment_recommendation": "200字以内的投资建议，纯文本格式，给出明确的操作指令（买入/卖出/观望）和核心理由 (string)。如果无数据，请填'无建议'。",
     "analysis_reference": [
         {{
             "title": "参考来源标题 (string)",

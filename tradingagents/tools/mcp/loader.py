@@ -71,7 +71,14 @@ def load_local_mcp_tools(toolkit: Optional[Dict] = None) -> List[Any]:
     logger.info("[MCP Loader] 开始加载本地 MCP 工具...")
     
     try:
-        from tradingagents.tools.mcp.tools import news, market, fundamentals, sentiment, china, reports
+        from tradingagents.tools.mcp.tools import news, market, fundamentals, sentiment, china
+        try:
+            from tradingagents.tools.mcp.tools import finance
+            HAS_FINANCE_TOOLS = True
+        except Exception as e:
+            logger.warning(f"⚠️ Finance tools module import failed: {e}")
+            HAS_FINANCE_TOOLS = False
+            finance = None
         
         # 设置工具配置
         config = toolkit or {}
@@ -80,134 +87,134 @@ def load_local_mcp_tools(toolkit: Optional[Dict] = None) -> List[Any]:
         fundamentals.set_toolkit_config(config)
         sentiment.set_toolkit_config(config)
         china.set_toolkit_config(config)
+        # finance module doesn't have set_toolkit_config yet, using global manager
         
         tools = []
         
         if LANGCHAIN_TOOLS_AVAILABLE:
             from langchain_core.tools import tool as lc_tool
             
-            @lc_tool
-            def get_stock_news(stock_code: str, max_news: int = 10) -> str:
-                """
-                统一新闻获取工具 - 根据股票代码自动获取相应市场的新闻。
-                
-                Args:
-                    stock_code: 股票代码（A股如600519，港股如0700.HK，美股如AAPL）
-                    max_news: 获取新闻的最大数量，默认10条
-                """
-                return news.get_stock_news(stock_code, max_news)
+            # Add Finance Tools (including merged Core tools)
+            if HAS_FINANCE_TOOLS and finance:
+                finance_funcs = [
+                    # 核心统一工具 (已合并去重)
+                    finance.get_stock_data,         # 统一行情 (原 get_stock_market_data 已合并)
+                    finance.get_stock_news,         # 统一新闻
+                    finance.get_stock_fundamentals, # 统一基本面 (替代 company_performance_*)
+                    finance.get_stock_sentiment,    # 统一情绪
+                    finance.get_china_market_overview, # 市场概览
+                    
+                    # Finance 特色工具
+                    finance.get_stock_data_minutes,
+                    # finance.get_company_performance,     # 废弃: 由 get_stock_fundamentals 统一处理
+                    # finance.get_company_performance_hk,  # 废弃
+                    # finance.get_company_performance_us,  # 废弃
+                    finance.get_macro_econ,
+                    finance.get_money_flow,
+                    finance.get_margin_trade,
+                    finance.get_fund_data,
+                    finance.get_fund_manager_by_name,
+                    finance.get_index_data,
+                    finance.get_csi_index_constituents,
+                    finance.get_convertible_bond,
+                    finance.get_block_trade,
+                    finance.get_dragon_tiger_inst,
+                    finance.get_finance_news,       # 搜索新闻 (与 get_stock_news 场景不同，保留)
+                    finance.get_hot_news_7x24,      # 7x24快讯 (与 get_stock_news 场景不同，保留)
+                    finance.get_current_timestamp
+                ]
+                for func in finance_funcs:
+                    try:
+                        tools.append(lc_tool(func))
+                    except Exception as e:
+                        logger.error(f"Failed to create langchain tool for {func.__name__}: {e}")
+
+            # Legacy Core tools deprecated - using finance module implementations
+            # @lc_tool
+            # def get_stock_news(stock_code: str, max_news: int = 10) -> str:
+            #     """
+            #     统一新闻获取工具 - 根据股票代码自动获取相应市场的新闻。
+            #     
+            #     Args:
+            #         stock_code: 股票代码（A股如600519，港股如0700.HK，美股如AAPL）
+            #         max_news: 获取新闻的最大数量，默认10条
+            #     """
+            #     return news.get_stock_news(stock_code, max_news)
+            # 
+            # @lc_tool
+            # def get_stock_market_data(ticker: str, start_date: str, end_date: str) -> str:
+            #     """
+            #     统一股票市场数据工具 - 获取股票的历史价格、技术指标和市场表现。
+            #     
+            #     Args:
+            #         ticker: 股票代码
+            #         start_date: 开始日期，格式：YYYY-MM-DD
+            #         end_date: 结束日期，格式：YYYY-MM-DD
+            #     """
+            #     return market.get_stock_market_data(ticker, start_date, end_date)
+            # 
+            # @lc_tool
+            # def get_stock_fundamentals(
+            #     ticker: str,
+            #     curr_date: str = None,
+            #     start_date: str = None,
+            #     end_date: str = None
+            # ) -> str:
+            #     """
+            #     统一股票基本面分析工具 - 获取股票的财务数据和估值指标。
+            #     
+            #     Args:
+            #         ticker: 股票代码
+            #         curr_date: 当前日期（可选）
+            #         start_date: 开始日期（可选）
+            #         end_date: 结束日期（可选）
+            #     """
+            #     return fundamentals.get_stock_fundamentals(ticker, curr_date, start_date, end_date)
+            # 
+            # @lc_tool
+            # def get_stock_sentiment(
+            #     ticker: str,
+            #     curr_date: str,
+            #     start_date: str = None,
+            #     end_date: str = None,
+            #     source_name: str = None
+            # ) -> str:
+            #     """
+            #     统一股票情绪分析工具 - 获取市场对股票的情绪倾向。
+            #     
+            #     Args:
+            #         ticker: 股票代码
+            #         curr_date: 当前日期，格式：YYYY-MM-DD
+            #         start_date: 开始日期（可选）
+            #         end_date: 结束日期（可选）
+            #         source_name: 指定数据源名称（可选）
+            #     """
+            #     return sentiment.get_stock_sentiment(ticker, curr_date, start_date, end_date, source_name)
+            # 
+            # @lc_tool
+            # def get_china_market_overview(
+            #     date: str = None,
+            #     include_indices: bool = True,
+            #     include_sectors: bool = True
+            # ) -> str:
+            #     """
+            #     中国A股市场概览工具 - 获取中国A股市场的整体概况。
+            #     
+            #     Args:
+            #         date: 查询日期（可选，默认为今天）
+            #         include_indices: 是否包含主要指数数据
+            #         include_sectors: 是否包含板块表现数据
+            #     """
+            #     return china.get_china_market_overview(date, include_indices, include_sectors)
             
-            @lc_tool
-            def get_stock_market_data(ticker: str, start_date: str, end_date: str) -> str:
-                """
-                统一股票市场数据工具 - 获取股票的历史价格、技术指标和市场表现。
-                
-                Args:
-                    ticker: 股票代码
-                    start_date: 开始日期，格式：YYYY-MM-DD
-                    end_date: 结束日期，格式：YYYY-MM-DD
-                """
-                return market.get_stock_market_data(ticker, start_date, end_date)
-            
-            @lc_tool
-            def get_stock_fundamentals(
-                ticker: str,
-                curr_date: str = None,
-                start_date: str = None,
-                end_date: str = None
-            ) -> str:
-                """
-                统一股票基本面分析工具 - 获取股票的财务数据和估值指标。
-                
-                Args:
-                    ticker: 股票代码
-                    curr_date: 当前日期（可选）
-                    start_date: 开始日期（可选）
-                    end_date: 结束日期（可选）
-                """
-                return fundamentals.get_stock_fundamentals(ticker, curr_date, start_date, end_date)
-            
-            @lc_tool
-            def get_stock_sentiment(
-                ticker: str,
-                curr_date: str,
-                start_date: str = None,
-                end_date: str = None,
-                source_name: str = None
-            ) -> str:
-                """
-                统一股票情绪分析工具 - 获取市场对股票的情绪倾向。
-                
-                Args:
-                    ticker: 股票代码
-                    curr_date: 当前日期，格式：YYYY-MM-DD
-                    start_date: 开始日期（可选）
-                    end_date: 结束日期（可选）
-                    source_name: 指定数据源名称（可选）
-                """
-                return sentiment.get_stock_sentiment(ticker, curr_date, start_date, end_date, source_name)
-            
-            @lc_tool
-            def get_china_market_overview(
-                date: str = None,
-                include_indices: bool = True,
-                include_sectors: bool = True
-            ) -> str:
-                """
-                中国A股市场概览工具 - 获取中国A股市场的整体概况。
-                
-                Args:
-                    date: 查询日期（可选，默认为今天）
-                    include_indices: 是否包含主要指数数据
-                    include_sectors: 是否包含板块表现数据
-                """
-                return china.get_china_market_overview(date, include_indices, include_sectors)
-            
-            @lc_tool
-            def list_analysis_reports() -> str:
-                """列出当前可用的所有分析报告目录。"""
-                return reports.list_reports()
-            
-            @lc_tool
-            def get_analysis_report(
-                field_name: str,
-                max_chars: int = None,
-                summary: bool = False
-            ) -> str:
-                """
-                获取指定分析报告的内容。
-                
-                Args:
-                    field_name: 报告字段名
-                    max_chars: 最大返回字符数（可选）
-                    summary: 是否返回摘要（可选）
-                """
-                return reports.get_report_content(field_name, max_chars, summary)
-            
-            @lc_tool
-            def get_analysis_reports_batch(
-                field_names: list,
-                max_chars_each: int = None
-            ) -> str:
-                """
-                批量获取多个分析报告的内容。
-                
-                Args:
-                    field_names: 报告字段名列表
-                    max_chars_each: 每个报告的最大字符数（可选）
-                """
-                return reports.get_reports_batch(field_names, max_chars_each)
-            
-            tools = [
-                get_stock_news,
-                get_stock_market_data,
-                get_stock_fundamentals,
-                get_stock_sentiment,
-                get_china_market_overview,
-                list_analysis_reports,
-                get_analysis_report,
-                get_analysis_reports_batch,
-            ]
+            # Legacy Core tools deprecated - using finance module implementations
+            # tools.extend([
+            #     get_stock_news,
+            #     get_stock_market_data,
+            #     get_stock_fundamentals,
+            #     get_stock_sentiment,
+            #     get_china_market_overview,
+            # ])
         
         execution_time = (datetime.now() - start_time).total_seconds()
         logger.info(f"✅ [MCP Loader] 加载完成，共 {len(tools)} 个本地工具，耗时 {execution_time:.2f}秒")

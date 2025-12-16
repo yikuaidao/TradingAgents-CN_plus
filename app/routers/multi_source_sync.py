@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from app.services.multi_source_basics_sync_service import get_multi_source_sync_service
-from app.services.data_sources.manager import DataSourceManager
+from tradingagents.dataflows.manager import DataSourceManager
 
 logger = logging.getLogger(__name__)
 

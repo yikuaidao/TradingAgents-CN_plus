@@ -35,7 +35,8 @@ rich
 questionary
 langchain-anthropic>=1.2.0
 langchain-google-genai>=3.2.0
-langchain-mcp>=0.1.0
+langchain-mcp-adapters>=0.1.0
+langchain-core>=0.2.0
 google-genai>=0.1.0
 dashscope
 streamlit
@@ -61,3 +62,4 @@ aiofiles>=0.8.0  # 异步文件操作
 httpx>=0.24.0  # 异步HTTP客户端
 sse-starlette>=1.0.0  # Server-Sent Events支持
 concurrent-log-handler>=0.9.24  # Windows 友好的日志轮转处理器
+openpyxl>=3.1.0  # Excel文件读写支持 (AKShare依赖)

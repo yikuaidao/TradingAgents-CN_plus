@@ -10,6 +10,7 @@ import logging
 
 from ..base_provider import BaseStockDataProvider
 from tradingagents.config.providers_config import get_provider_config
+from tradingagents.utils.stock_utils import StockUtils, StockMarket
 
 # 尝试导入tushare
 try:
@@ -261,6 +262,10 @@ class TushareProvider(BaseStockDataProvider):
             return None
 
         try:
+            # 港股处理
+            if market == "HK":
+                return await self._get_hk_stock_list()
+
             # 构建查询参数
             params = {
                 'list_status': 'L',  # 只获取上市股票
@@ -271,8 +276,6 @@ class TushareProvider(BaseStockDataProvider):
                 # 根据市场筛选
                 if market == "CN":
                     params['exchange'] = 'SSE,SZSE'  # 沪深交易所
-                elif market == "HK":
-                    return None  # Tushare港股需要单独处理
                 elif market == "US":
                     return None  # Tushare不支持美股
             
@@ -294,6 +297,30 @@ class TushareProvider(BaseStockDataProvider):
         except Exception as e:
             self.logger.error(f"❌ 获取股票列表失败: {e}")
             return None
+
+    async def _get_hk_stock_list(self) -> Optional[List[Dict[str, Any]]]:
+        """获取港股列表"""
+        try:
+            # Tushare 港股列表接口
+            df = await asyncio.to_thread(
+                self.api.hk_basic,
+                list_status='L'
+            )
+            
+            if df is None or df.empty:
+                return None
+            
+            stock_list = []
+            for _, row in df.iterrows():
+                # 标准化
+                stock_info = self.standardize_basic_info(row.to_dict())
+                stock_list.append(stock_info)
+            
+            self.logger.info(f"✅ 获取港股列表: {len(stock_list)}只")
+            return stock_list
+        except Exception as e:
+            self.logger.error(f"❌ 获取港股列表失败: {e}")
+            return None
     
     async def get_stock_basic_info(self, symbol: str = None) -> Optional[Union[Dict[str, Any], List[Dict[str, Any]]]]:
         """获取股票基础信息"""
@@ -304,11 +331,19 @@ class TushareProvider(BaseStockDataProvider):
             if symbol:
                 # 获取单个股票信息
                 ts_code = self._normalize_ts_code(symbol)
-                df = await asyncio.to_thread(
-                    self.api.stock_basic,
-                    ts_code=ts_code,
-                    fields='ts_code,symbol,name,area,industry,market,exchange,list_date,is_hs,act_name,act_ent_type'
-                )
+                
+                # 判断市场并调用对应接口
+                if '.HK' in ts_code:
+                    df = await asyncio.to_thread(
+                        self.api.hk_basic,
+                        ts_code=ts_code
+                    )
+                else:
+                    df = await asyncio.to_thread(
+                        self.api.stock_basic,
+                        ts_code=ts_code,
+                        fields='ts_code,symbol,name,area,industry,market,exchange,list_date,is_hs,act_name,act_ent_type'
+                    )
                 
                 if df is None or df.empty:
                     return None
@@ -345,12 +380,21 @@ class TushareProvider(BaseStockDataProvider):
             end_date = datetime.now().strftime('%Y%m%d')
             start_date = (datetime.now() - timedelta(days=3)).strftime('%Y%m%d')
 
-            df = await asyncio.to_thread(
-                self.api.daily,
-                ts_code=ts_code,
-                start_date=start_date,
-                end_date=end_date
-            )
+            # 判断市场并调用对应接口
+            if '.HK' in ts_code:
+                df = await asyncio.to_thread(
+                    self.api.hk_daily,
+                    ts_code=ts_code,
+                    start_date=start_date,
+                    end_date=end_date
+                )
+            else:
+                df = await asyncio.to_thread(
+                    self.api.daily,
+                    ts_code=ts_code,
+                    start_date=start_date,
+                    end_date=end_date
+                )
 
             if df is not None and not df.empty:
                 # 取最新一天的数据
@@ -365,6 +409,7 @@ class TushareProvider(BaseStockDataProvider):
                     'high': row.get('high'),
                     'low': row.get('low'),
                     'close': row.get('close'),  # 收盘价
+                    'price': row.get('close'),  # 🔥 兼容 price 字段
                     'pre_close': row.get('pre_close'),
                     'change': row.get('change'),  # 涨跌额
                     'pct_chg': row.get('pct_chg'),  # 涨跌幅
@@ -519,17 +564,32 @@ class TushareProvider(BaseStockDataProvider):
             }
             freq = freq_map.get(period, "D")
 
-            # 使用 ts.pro_bar() 函数获取前复权数据
-            # 注意：pro_bar 是 tushare 模块的函数，不是 api 对象的方法
-            df = await asyncio.to_thread(
-                ts.pro_bar,
-                ts_code=ts_code,
-                api=self.api,  # 传入 api 对象
-                start_date=start_str,
-                end_date=end_str,
-                freq=freq,
-                adj='qfq'  # 前复权（与同花顺一致）
-            )
+            # 港股特殊处理
+            if ts_code.endswith('.HK'):
+                # 港股使用 hk_daily 接口
+                # 注意：hk_daily 不支持复权，只能获取未复权数据
+                if period != "daily":
+                    self.logger.warning(f"⚠️ 港股历史数据仅支持日线 (daily)，当前请求: {period}")
+                    return None
+                
+                df = await asyncio.to_thread(
+                    self.api.hk_daily,
+                    ts_code=ts_code,
+                    start_date=start_str,
+                    end_date=end_str
+                )
+            else:
+                # A股使用 ts.pro_bar() 函数获取前复权数据
+                # 注意：pro_bar 是 tushare 模块的函数，不是 api 对象的方法
+                df = await asyncio.to_thread(
+                    ts.pro_bar,
+                    ts_code=ts_code,
+                    api=self.api,  # 传入 api 对象
+                    start_date=start_str,
+                    end_date=end_str,
+                    freq=freq,
+                    adj='qfq'  # 前复权（与同花顺一致）
+                )
 
             if df is None or df.empty:
                 self.logger.warning(
@@ -1204,6 +1264,18 @@ class TushareProvider(BaseStockDataProvider):
         if '.' in symbol:
             return symbol  # 已经是ts_code格式
 
+        # 识别市场
+        market = StockUtils.identify_stock_market(symbol)
+
+        # 港股处理
+        if market == StockMarket.HONG_KONG:
+            # Tushare 港股代码通常是 5 位数字，不足补0
+            # 例如 700 -> 00700.HK
+            clean_symbol = symbol.strip()
+            if len(clean_symbol) < 5:
+                clean_symbol = clean_symbol.zfill(5)
+            return f"{clean_symbol}.HK"
+
         # 6位数字代码，需要添加后缀
         if symbol.isdigit() and len(symbol) == 6:
             # 北交所: 92(新号段), 8(83/87/88), 43(新三板/北交所)
@@ -1241,6 +1313,14 @@ class TushareProvider(BaseStockDataProvider):
                 "exchange_name": "北京证券交易所",
                 "currency": "CNY",
                 "timezone": "Asia/Shanghai"
+            }
+        elif '.HK' in ts_code:
+            return {
+                "market": "HK",
+                "exchange": "HKEX",
+                "exchange_name": "香港交易所",
+                "currency": "HKD",
+                "timezone": "Asia/Hong_Kong"
             }
         else:
             return {

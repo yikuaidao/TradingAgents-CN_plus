@@ -27,7 +27,7 @@ def _identify_stock_type(stock_code: str) -> str:
     stock_code = stock_code.upper().strip()
     
     # A股判断
-    if re.match(r'^(00|30|60|68)\d{4}$', stock_code):
+    if re.match(r'^(00|30|60|68)\d{4}(\.SZ|\.SH|\.BJ)?$', stock_code):
         return "A股"
     elif re.match(r'^(SZ|SH)\d{6}$', stock_code):
         return "A股"
@@ -179,49 +179,61 @@ def get_stock_news(
     
     # 尝试从 AKShare 同步新闻
     try:
-        from tradingagents.dataflows.providers.china.akshare import AKShareProvider
-        import asyncio
-        
-        clean_code = stock_code.replace('.SH', '').replace('.SZ', '').replace('.SS', '')\
-                               .replace('.XSHE', '').replace('.XSHG', '').replace('.HK', '')
-        
-        provider = AKShareProvider()
-        
-        # 在新线程中运行异步任务
-        def run_async():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                return loop.run_until_complete(provider.get_stock_news(symbol=clean_code, limit=max_news))
-            finally:
-                loop.close()
-        
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(run_async)
-            news_data = future.result(timeout=30)
-        
-        if news_data:
-            # 格式化新闻数据
-            report = f"# {stock_code} 最新新闻 (AKShare)\n\n"
-            report += f"📅 查询时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            report += f"📊 新闻数量: {len(news_data)} 条\n\n"
+        # 如果是美股，跳过 AKShare
+        if stock_type == "美股":
+            # TODO: 美股新闻获取逻辑 (OpenAI, Google等)
+            # 暂时尝试使用数据库缓存或返回空
+            if not db_news:
+                logger.info(f"[MCP新闻工具] 美股新闻暂仅支持数据库缓存")
+            pass
+        else:
+            from tradingagents.dataflows.providers.china.akshare import AKShareProvider
+            import asyncio
             
-            for i, news in enumerate(news_data[:max_news], 1):
-                title = news.get('title', '无标题')
-                content = news.get('content', '') or news.get('summary', '')
-                source = news.get('source', '未知来源')
-                
-                report += f"## {i}. {title}\n\n"
-                report += f"**来源**: {source}\n\n"
-                
-                if content:
-                    content_preview = content[:500] + '...' if len(content) > 500 else content
-                    report += f"{content_preview}\n\n"
-                
-                report += "---\n\n"
+            clean_code = stock_code.replace('.SH', '').replace('.SZ', '').replace('.SS', '')\
+                                   .replace('.XSHE', '').replace('.XSHG', '').replace('.HK', '')
             
-            return _format_news_result(report, "AKShare")
+            provider = AKShareProvider()
+            
+            # 在新线程中运行异步任务
+            def run_async():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    # 对于港股，确保 AKShareProvider 能正确处理
+                    if stock_type == "港股":
+                        # AKShare 获取个股新闻的接口主要是 stock_news_em，通常支持港股代码
+                        pass
+                    return loop.run_until_complete(provider.get_stock_news(symbol=clean_code, limit=max_news))
+                finally:
+                    loop.close()
+            
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(run_async)
+                news_data = future.result(timeout=30)
+            
+            if news_data:
+                # 格式化新闻数据
+                report = f"# {stock_code} 最新新闻 (AKShare)\n\n"
+                report += f"📅 查询时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                report += f"📊 新闻数量: {len(news_data)} 条\n\n"
+                
+                for i, news in enumerate(news_data[:max_news], 1):
+                    title = news.get('title', '无标题')
+                    content = news.get('content', '') or news.get('summary', '')
+                    source = news.get('source', '未知来源')
+                    
+                    report += f"## {i}. {title}\n\n"
+                    report += f"**来源**: {source}\n\n"
+                    
+                    if content:
+                        content_preview = content[:500] + '...' if len(content) > 500 else content
+                        report += f"{content_preview}\n\n"
+                    
+                    report += "---\n\n"
+                
+                return _format_news_result(report, "AKShare")
     except Exception as e:
         logger.warning(f"[MCP新闻工具] AKShare新闻获取失败: {e}")
     

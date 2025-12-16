@@ -9,6 +9,7 @@ from typing import Dict, Any, List, Optional, Union
 import pandas as pd
 
 from tradingagents.config.runtime_settings import get_int
+from tradingagents.utils.stock_utils import StockUtils, StockMarket
 from ..base_provider import BaseStockDataProvider
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,35 @@ class AKShareProvider(BaseStockDataProvider):
     def _initialize_akshare(self):
         """初始化AKShare连接"""
         try:
+            # 🔥 优先 Patch pandas，在导入 akshare 之前
+            # 修复 pandas read_excel 问题
+            # akshare 内部可能调用 pd.read_excel 但未指定 engine，导致 "Excel file format cannot be determined"
+            try:
+                import pandas as pd
+                if not hasattr(pd, '_read_excel_patched'):
+                    original_read_excel = pd.read_excel
+                    
+                    def patched_read_excel(io, **kwargs):
+                        # 如果未指定 engine，尝试自动推断或依次尝试
+                        if 'engine' not in kwargs:
+                            # 优先尝试 openpyxl (xlsx)
+                            try:
+                                return original_read_excel(io, engine='openpyxl', **kwargs)
+                            except:
+                                # 回退到 xlrd (xls)
+                                try:
+                                    return original_read_excel(io, engine='xlrd', **kwargs)
+                                except:
+                                    pass # 继续尝试默认行为
+                        
+                        return original_read_excel(io, **kwargs)
+                        
+                    pd.read_excel = patched_read_excel
+                    pd._read_excel_patched = True
+                    logger.info("🔧 已应用 pandas.read_excel 补丁 (自动尝试 openpyxl/xlrd)")
+            except Exception as e:
+                logger.warning(f"⚠️ 无法应用 pandas.read_excel 补丁: {e}")
+
             import akshare as ak
             import requests
             import time
@@ -57,6 +87,9 @@ class AKShareProvider(BaseStockDataProvider):
                 original_get = requests.get
                 last_request_time = {'time': 0}  # 使用字典以便在闭包中修改
                 
+                # 修复 pandas read_excel 问题 (已移至最前)
+                pass
+
                 # 获取超时配置，默认为 30 秒（原为 10 秒）
                 default_timeout = get_int("TA_AKSHARE_TIMEOUT", "ta_akshare_timeout", 30)
 
@@ -392,10 +425,13 @@ class AKShareProvider(BaseStockDataProvider):
             logger.error(f"❌ AKShare获取股票列表失败: {e}")
             return None
 
-    async def get_stock_list(self) -> List[Dict[str, Any]]:
+    async def get_stock_list(self, market: str = None) -> List[Dict[str, Any]]:
         """
         获取股票列表
-
+        
+        Args:
+            market: 市场代码 (CN, HK, US)
+            
         Returns:
             股票列表，包含代码和名称
         """
@@ -403,32 +439,115 @@ class AKShareProvider(BaseStockDataProvider):
             return []
 
         try:
-            logger.info("📋 获取AKShare股票列表...")
-
-            # 使用线程池异步获取股票列表，添加超时保护
-            def fetch_stock_list():
-                return self.ak.stock_info_a_code_name()
-
-            stock_df = await asyncio.to_thread(fetch_stock_list)
-
-            if stock_df is None or stock_df.empty:
-                logger.warning("⚠️ AKShare股票列表为空")
-                return []
-
-            # 转换为标准格式
             stock_list = []
-            for _, row in stock_df.iterrows():
-                stock_list.append({
-                    "code": str(row.get("code", "")),
-                    "name": str(row.get("name", "")),
-                    "source": "akshare"
-                })
+            
+            # 1. 获取A股列表 (默认或指定CN)
+            if not market or market == "CN":
+                logger.info("📋 获取AKShare A股列表...")
+                
+                stock_df = None
+                
+                # 尝试方法1: stock_info_a_code_name
+                try:
+                    def fetch_stock_list():
+                        return self.ak.stock_info_a_code_name()
+                    stock_df = await asyncio.to_thread(fetch_stock_list)
+                except Exception as e:
+                    logger.warning(f"⚠️ stock_info_a_code_name 失败: {e}")
+                
+                # 尝试方法2: stock_zh_a_spot_em (作为备选)
+                if stock_df is None or stock_df.empty:
+                    logger.info("🔄 尝试使用 stock_zh_a_spot_em 获取A股列表...")
+                    try:
+                        def fetch_spot_list():
+                            return self.ak.stock_zh_a_spot_em()
+                        stock_df = await asyncio.to_thread(fetch_spot_list)
+                    except Exception as e:
+                        logger.error(f"❌ stock_zh_a_spot_em 失败: {e}")
 
-            logger.info(f"✅ AKShare股票列表获取成功: {len(stock_list)}只股票")
+                if stock_df is not None and not stock_df.empty:
+                    for _, row in stock_df.iterrows():
+                        # 兼容不同的列名
+                        code = str(row.get("code", "") or row.get("代码", ""))
+                        name = str(row.get("name", "") or row.get("名称", ""))
+                        
+                        if code:
+                            stock_list.append({
+                                "code": code,
+                                "name": name,
+                                "market": "CN",
+                                "source": "akshare"
+                            })
+                    logger.info(f"✅ AKShare A股列表获取成功: {len(stock_list)}只")
+                else:
+                    logger.warning("⚠️ AKShare A股列表为空")
+
+            # 2. 获取港股列表 (默认或指定HK)
+            if not market or market == "HK":
+                hk_list = await self._get_hk_stock_list()
+                if hk_list:
+                    stock_list.extend(hk_list)
+
             return stock_list
 
         except Exception as e:
             logger.error(f"❌ AKShare获取股票列表失败: {e}")
+            return []
+
+    async def _get_hk_stock_list(self) -> List[Dict[str, Any]]:
+        """获取港股列表"""
+        try:
+            logger.info("📋 获取AKShare港股列表...")
+            
+            def fetch_hk_list():
+                # 使用 stock_hk_spot 获取所有港股实时行情（包含列表信息）
+                # 增加重试机制
+                import time
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        return self.ak.stock_hk_spot()
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            time.sleep(1)
+                            continue
+                        raise e
+                return None
+
+            df = await asyncio.to_thread(fetch_hk_list)
+            
+            if df is None or df.empty:
+                return []
+                
+            hk_list = []
+            for _, row in df.iterrows():
+                # AKShare 港股代码通常为 5位数字
+                code = str(row.get("code", "") if "code" in row else row.get("代码", ""))
+                name = str(row.get("name", "") if "name" in row else row.get("名称", ""))
+                
+                if code:
+                    # 标准化为 5位
+                    clean_code = code.zfill(5)
+                    # 添加 .HK 后缀以便统一识别 (或者保持纯数字，由 StockUtils 处理)
+                    # StockUtils 识别 5位数字为 HK，所以保持纯数字即可，或者加 .HK
+                    # Tushare 返回 .HK，为了统一，这里也返回 .HK ?
+                    # AKShare 的 fetch functions 通常接受纯数字或 .HK
+                    # 这里我们返回带 .HK 后缀的标准代码，方便上层使用
+                    full_code = f"{clean_code}.HK"
+                    
+                    hk_list.append({
+                        "code": full_code,
+                        "symbol": clean_code,
+                        "name": name,
+                        "market": "HK",
+                        "source": "akshare"
+                    })
+            
+            logger.info(f"✅ AKShare港股列表获取成功: {len(hk_list)}只")
+            return hk_list
+            
+        except Exception as e:
+            logger.error(f"❌ 获取港股列表失败: {e}")
             return []
     
     async def get_stock_basic_info(self, code: str) -> Optional[Dict[str, Any]]:
@@ -505,6 +624,55 @@ class AKShareProvider(BaseStockDataProvider):
     async def _get_stock_info_detail(self, code: str) -> Dict[str, Any]:
         """获取股票详细信息"""
         try:
+            # 检查是否为港股
+            is_hk = False
+            if code.endswith('.HK') or (code.isdigit() and len(code) == 5):
+                is_hk = True
+            
+            if is_hk:
+                # 港股处理
+                try:
+                    # 尝试从港股列表获取信息
+                    def fetch_hk_list():
+                        return self.ak.stock_hk_spot()
+                    
+                    hk_list = await asyncio.to_thread(fetch_hk_list)
+                    if hk_list is not None and not hk_list.empty:
+                        # 尝试匹配代码 (支持 00700 和 00700.HK)
+                        clean_code = code.replace('.HK', '')
+                        # stock_hk_spot 返回的列名是中文: 代码, 中文名称
+                        # 确保列名存在
+                        if '代码' in hk_list.columns:
+                            stock_row = hk_list[hk_list['代码'] == clean_code]
+                            
+                            if not stock_row.empty:
+                                row = stock_row.iloc[0]
+                                name = str(row['中文名称']) if '中文名称' in row else f"港股{clean_code}"
+                                return {
+                                    "code": code,
+                                    "name": name,
+                                    "industry": "未知", # stock_hk_spot 没有行业信息
+                                    "area": "HK",
+                                    "list_date": "未知"
+                                }
+                        # 尝试英文列名 (以防万一)
+                        elif 'symbol' in hk_list.columns:
+                            stock_row = hk_list[hk_list['symbol'] == clean_code]
+                            if not stock_row.empty:
+                                row = stock_row.iloc[0]
+                                return {
+                                    "code": code,
+                                    "name": str(row.get('name', f"港股{clean_code}")),
+                                    "industry": str(row.get('industry', '未知')),
+                                    "area": "HK",
+                                    "list_date": "未知"
+                                }
+                except Exception as e:
+                    logger.debug(f"获取港股{code}信息失败: {e}")
+                
+                return {"code": code, "name": f"港股{code}", "industry": "未知", "area": "HK"}
+
+            # A股处理
             # 方法1: 尝试获取个股详细信息（包含行业、地区等详细信息）
             def fetch_individual_info():
                 return self.ak.stock_individual_info_em(symbol=code)
@@ -538,7 +706,13 @@ class AKShareProvider(BaseStockDataProvider):
 
                     return info
             except Exception as e:
-                logger.debug(f"获取{code}个股详细信息失败: {e}")
+                # 检查是否为 DataFrame 创建错误
+                if "If using all scalar values, you must pass an index" in str(e):
+                    logger.warning(f"⚠️ AKShare stock_individual_info_em 返回了标量值但未包含索引，尝试兼容处理: {e}")
+                    # 某些版本的 AKShare 可能直接返回标量或非标准结构，这里作为降级
+                    # 但由于我们也无法直接获取数据内容（它在内部抛出异常），只能跳过并记录
+                else:
+                    logger.debug(f"获取{code}个股详细信息失败: {e}")
 
             # 方法2: 从缓存的股票列表中获取基本信息（只有代码和名称）
             try:
@@ -603,6 +777,19 @@ class AKShareProvider(BaseStockDataProvider):
     
     def _get_market_info(self, code: str) -> Dict[str, Any]:
         """获取市场信息"""
+        # 使用 StockUtils 识别市场
+        market = StockUtils.identify_stock_market(code)
+        
+        if market == StockMarket.HONG_KONG:
+            return {
+                "market_type": "HK",
+                "exchange": "HKEX",
+                "exchange_name": "香港证券交易所",
+                "currency": "HKD",
+                "timezone": "Asia/Hong_Kong"
+            }
+        
+        # A股判断保持原有逻辑或优化
         if code.startswith(('60', '68')):
             return {
                 "market_type": "CN",
@@ -783,24 +970,177 @@ class AKShareProvider(BaseStockDataProvider):
                     logger.error(f"❌ 批量获取实时行情失败，已达最大重试次数: {e}")
                     return {}
 
+    def _is_index(self, code: str) -> bool:
+        """判断是否为指数代码"""
+        # 上证指数：000开头，.SH后缀
+        if code.endswith('.SH') and code.startswith('000'):
+            return True
+        # 深证指数：399开头，.SZ后缀
+        if code.endswith('.SZ') and code.startswith('399'):
+            return True
+        return False
+
     async def get_stock_quotes(self, code: str) -> Optional[Dict[str, Any]]:
         """
         获取单个股票实时行情
-
-        🔥 策略：使用 stock_bid_ask_em 接口获取单个股票的实时行情报价
-        - 优点：只获取单个股票数据，速度快，不浪费资源
-        - 适用场景：手动同步单个股票
-
-        Args:
-            code: 股票代码
-
-        Returns:
-            标准化的行情数据
         """
         if not self.connected:
             return None
 
         try:
+            # 识别市场
+            market = StockUtils.identify_stock_market(code)
+            
+            # ========== 港股处理 ==========
+            if market == StockMarket.HONG_KONG:
+                # 移除 .HK 后缀
+                symbol = code.replace(".HK", "")
+                logger.info(f"📈 获取港股 {code} (symbol={symbol}) 行情...")
+                
+                # 使用 stock_hk_hist 获取日线数据作为行情 (因为没有单只港股实时接口)
+                # 获取最近3天的数据
+                from datetime import datetime, timedelta, timezone
+                end_date = datetime.now().strftime('%Y%m%d')
+                start_date = (datetime.now() - timedelta(days=5)).strftime('%Y%m%d')
+                
+                def fetch_hk_hist():
+                    return self.ak.stock_hk_hist(
+                        symbol=symbol,
+                        period="daily",
+                        start_date=start_date,
+                        end_date=end_date,
+                        adjust=""
+                    )
+                
+                df = await asyncio.to_thread(fetch_hk_hist)
+                
+                if df is not None and not df.empty:
+                    # 取最新一天
+                    row = df.iloc[-1]
+                    
+                    # 映射字段 (akshare hk hist 返回列名通常是中文)
+                    # 日期, 开盘, 收盘, 最高, 最低, 成交量, 成交额, ...
+                    quotes = {
+                        "code": code,
+                        "symbol": symbol,
+                        "name": f"港股{symbol}", # 历史数据不含名称
+                        "price": self._safe_float(row.get("收盘", 0)),
+                        "close": self._safe_float(row.get("收盘", 0)),
+                        "open": self._safe_float(row.get("开盘", 0)),
+                        "high": self._safe_float(row.get("最高", 0)),
+                        "low": self._safe_float(row.get("最低", 0)),
+                        "volume": self._safe_float(row.get("成交量", 0)),
+                        "amount": self._safe_float(row.get("成交额", 0)),
+                        "change": self._safe_float(row.get("涨跌额", 0)),
+                        "change_percent": self._safe_float(row.get("涨跌幅", 0)),
+                        # 补充字段
+                        "market_info": self._get_market_info(code),
+                        "data_source": "akshare",
+                        "last_sync": datetime.now(timezone.utc),
+                        "trade_date": str(row.get("日期", ""))
+                    }
+                    
+                    return quotes
+                else:
+                    logger.warning(f"⚠️ 未找到港股 {code} 的行情数据")
+                    return None
+
+            # ========== 指数处理 ==========
+            if self._is_index(code):
+                logger.info(f"📈 获取指数 {code} 实时行情...")
+                
+                def fetch_index_spot():
+                    # 尝试使用东方财富接口 (stock_zh_index_spot_em)
+                    try:
+                        # 东方财富指数实时行情，symbol参数通常是 "上证系列指数", "深证系列指数" 等
+                        # 或者尝试不传参数获取所有
+                        if hasattr(self.ak, 'stock_zh_index_spot_em'):
+                            # 尝试获取上证和深证指数
+                            df_sh = self.ak.stock_zh_index_spot_em(symbol="上证系列指数")
+                            df_sz = self.ak.stock_zh_index_spot_em(symbol="深证系列指数")
+                            
+                            # 合并数据
+                            frames = []
+                            if df_sh is not None and not df_sh.empty:
+                                frames.append(df_sh)
+                            if df_sz is not None and not df_sz.empty:
+                                frames.append(df_sz)
+                                
+                            if frames:
+                                return pd.concat(frames, ignore_index=True)
+                    except Exception as e:
+                        logger.warning(f"⚠️ 东方财富指数接口调用失败: {e}")
+
+                    # 尝试新浪接口 (stock_zh_index_spot_sina)
+                    try:
+                        if hasattr(self.ak, 'stock_zh_index_spot_sina'):
+                            return self.ak.stock_zh_index_spot_sina()
+                    except Exception as e:
+                        logger.warning(f"⚠️ 新浪指数接口调用失败: {e}")
+                        
+                    # 尝试旧接口
+                    if hasattr(self.ak, 'stock_zh_index_spot'):
+                        return self.ak.stock_zh_index_spot()
+                        
+                    return None
+
+                spot_df = await asyncio.to_thread(fetch_index_spot)
+                
+                if spot_df is not None and not spot_df.empty:
+                    # 查找对应指数
+                    # 代码格式通常是 sh000001 或 sz399001
+                    symbol = code.replace('.', '').lower() # 000001.SH -> 000001sh (wrong) -> sh000001
+                    if code.endswith('.SH'):
+                        symbol = f"sh{code[:6]}"
+                    elif code.endswith('.SZ'):
+                        symbol = f"sz{code[:6]}"
+                    
+                    # 尝试匹配
+                    # stock_zh_index_spot 返回列：代码, 名称, 最新价, 涨跌额, 涨跌幅, ...
+                    # 代码列通常是 sh000001 格式
+                    
+                    target_row = spot_df[spot_df['代码'] == symbol]
+                    
+                    if target_row.empty:
+                        # 尝试不带前缀匹配
+                        target_row = spot_df[spot_df['代码'] == code[:6]]
+                    
+                    if not target_row.empty:
+                        row = target_row.iloc[0]
+                        
+                        from datetime import datetime, timezone, timedelta
+                        cn_tz = timezone(timedelta(hours=8))
+                        now_cn = datetime.now(cn_tz)
+                        
+                        quotes = {
+                            "code": code,
+                            "symbol": code[:6],
+                            "name": str(row.get("名称", "")),
+                            "price": self._safe_float(row.get("最新价", 0)),
+                            "close": self._safe_float(row.get("最新价", 0)),
+                            "change": self._safe_float(row.get("涨跌额", 0)),
+                            "change_percent": self._safe_float(row.get("涨跌幅", 0)),
+                            "volume": self._safe_float(row.get("成交量", 0)),
+                            "amount": self._safe_float(row.get("成交额", 0)),
+                            "open": self._safe_float(row.get("今开", 0)),
+                            "high": self._safe_float(row.get("最高", 0)),
+                            "low": self._safe_float(row.get("最低", 0)),
+                            "pre_close": self._safe_float(row.get("昨收", 0)),
+                            "market_info": self._get_market_info(code),
+                            "data_source": "akshare",
+                            "last_sync": datetime.now(timezone.utc),
+                            "updated_at": now_cn.isoformat()
+                        }
+                        return quotes
+                    else:
+                        logger.warning(f"⚠️ 未在指数列表中找到 {code} (symbol={symbol})")
+                else:
+                    logger.warning("⚠️ 获取指数列表为空")
+                
+                # 如果实时行情失败，尝试获取日线最新一条
+                return await self._get_index_latest_daily(code)
+
+            # ========== A股处理 (原有逻辑) ==========
             logger.info(f"📈 使用 stock_bid_ask_em 接口获取 {code} 实时行情...")
 
             # 🔥 使用 stock_bid_ask_em 接口获取单个股票实时行情
@@ -950,6 +1290,54 @@ class AKShareProvider(BaseStockDataProvider):
             logger.debug(f"获取{code}实时行情数据失败: {e}")
             return {}
     
+    async def _get_index_latest_daily(self, code: str) -> Optional[Dict[str, Any]]:
+        """获取指数最新日线数据作为行情"""
+        try:
+            # 构造 symbol
+            symbol = code
+            if code.endswith('.SH'):
+                symbol = f"sh{code[:6]}"
+            elif code.endswith('.SZ'):
+                symbol = f"sz{code[:6]}"
+
+            def fetch_daily():
+                return self.ak.stock_zh_index_daily(symbol=symbol)
+
+            df = await asyncio.to_thread(fetch_daily)
+            
+            if df is not None and not df.empty:
+                row = df.iloc[-1]
+                # date, open, high, low, close, volume
+                
+                from datetime import datetime, timezone, timedelta
+                cn_tz = timezone(timedelta(hours=8))
+                now_cn = datetime.now(cn_tz)
+
+                quotes = {
+                    "code": code,
+                    "symbol": code[:6],
+                    "name": f"指数{code[:6]}", # 日线数据不含名称
+                    "price": self._safe_float(row.get("close", 0)),
+                    "close": self._safe_float(row.get("close", 0)),
+                    "open": self._safe_float(row.get("open", 0)),
+                    "high": self._safe_float(row.get("high", 0)),
+                    "low": self._safe_float(row.get("low", 0)),
+                    "volume": self._safe_float(row.get("volume", 0)),
+                    "amount": 0.0,
+                    "change": 0.0,
+                    "change_percent": 0.0,
+                    "market_info": self._get_market_info(code),
+                    "data_source": "akshare",
+                    "last_sync": datetime.now(timezone.utc),
+                    "updated_at": now_cn.isoformat(),
+                    "trade_date": str(row.get("date", ""))
+                }
+                return quotes
+            return None
+        except Exception as e:
+            logger.error(f"❌ 获取指数 {code} 日线数据失败: {e}")
+            return None
+
     def _safe_float(self, value: Any) -> float:
         """安全转换为浮点数"""
         try:
@@ -986,13 +1374,13 @@ class AKShareProvider(BaseStockDataProvider):
     ) -> Optional[pd.DataFrame]:
         """
         获取历史行情数据
-
+        
         Args:
             code: 股票代码
             start_date: 开始日期 (YYYY-MM-DD)
             end_date: 结束日期 (YYYY-MM-DD)
             period: 周期 (daily, weekly, monthly)
-
+            
         Returns:
             历史行情数据DataFrame
         """
@@ -1013,16 +1401,62 @@ class AKShareProvider(BaseStockDataProvider):
             # 格式化日期
             start_date_formatted = start_date.replace('-', '')
             end_date_formatted = end_date.replace('-', '')
+            
+            # 识别市场
+            market = StockUtils.identify_stock_market(code)
 
             # 获取历史数据
             def fetch_historical_data():
-                return self.ak.stock_zh_a_hist(
-                    symbol=code,
-                    period=ak_period,
-                    start_date=start_date_formatted,
-                    end_date=end_date_formatted,
-                    adjust="qfq"  # 前复权
-                )
+                if market == StockMarket.HONG_KONG:
+                    # 港股处理
+                    symbol = code.replace(".HK", "")
+                    return self.ak.stock_hk_hist(
+                        symbol=symbol,
+                        period=ak_period,
+                        start_date=start_date_formatted,
+                        end_date=end_date_formatted,
+                        adjust="qfq"
+                    )
+                elif self._is_index(code):
+                    # 指数处理
+                    symbol = code
+                    if code.endswith('.SH'):
+                        symbol = f"sh{code[:6]}"
+                    elif code.endswith('.SZ'):
+                        symbol = f"sz{code[:6]}"
+                    
+                    df = self.ak.stock_zh_index_daily(symbol=symbol)
+                    
+                    if df is not None and not df.empty:
+                        # 转换日期列为 datetime
+                        df['date'] = pd.to_datetime(df['date'])
+                        
+                        # 筛选日期范围
+                        start_dt = pd.to_datetime(start_date)
+                        end_dt = pd.to_datetime(end_date)
+                        
+                        mask = (df['date'] >= start_dt) & (df['date'] <= end_dt)
+                        df = df.loc[mask]
+                        
+                        # 重命名列以匹配标准处理 (stock_zh_index_daily 返回英文列名)
+                        # date, open, high, low, close, volume
+                        # 只是为了保持一致性，其实 _standardize_historical_columns 会处理
+                    
+                    return df
+                else:
+                    # A股处理
+                    # 移除后缀 (.SH, .SZ, .BJ)
+                    symbol = code
+                    if "." in code:
+                        symbol = code.split(".")[0]
+                        
+                    return self.ak.stock_zh_a_hist(
+                        symbol=symbol,
+                        period=ak_period,
+                        start_date=start_date_formatted,
+                        end_date=end_date_formatted,
+                        adjust="qfq"  # 前复权
+                    )
 
             hist_df = await asyncio.to_thread(fetch_historical_data)
 

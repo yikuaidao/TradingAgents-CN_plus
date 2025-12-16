@@ -185,7 +185,7 @@ services:
   # Nginx 反向代理
   # ports可以改为8080:80,或者其它的端口映射，前面一个是外部的端口，后面一个是容器内的端口
   nginx:
-    image: nginx:alpine
+    image: docker.1ms.run/nginx:alpine
     container_name: tradingagents-nginx
     restart: unless-stopped
     ports:

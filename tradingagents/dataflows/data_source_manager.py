@@ -24,6 +24,12 @@ logger = setup_dataflow_logging()
 # 导入统一数据源编码
 from tradingagents.constants import DataSourceCode
 
+try:
+    import nest_asyncio
+    nest_asyncio.apply()
+except (ImportError, ValueError):
+    pass
+
 
 class ChinaDataSource(Enum):
     """
@@ -1118,7 +1124,13 @@ class DataSourceManager:
                               })
 
                 # 数据质量异常时也尝试降级到其他数据源
-                fallback_result = self._try_fallback_sources(symbol, start_date, end_date)
+                fallback_result_tuple = self._try_fallback_sources(symbol, start_date, end_date)
+                # 解包元组
+                if isinstance(fallback_result_tuple, tuple):
+                    fallback_result, _ = fallback_result_tuple
+                else:
+                    fallback_result = fallback_result_tuple
+
                 if fallback_result and "❌" not in fallback_result and "错误" not in fallback_result:
                     logger.info(f"✅ [数据来源: 备用数据源] 降级成功获取数据: {symbol}")
                     return fallback_result
@@ -1138,7 +1150,51 @@ class DataSourceManager:
                             'error': str(e),
                             'event_type': 'data_fetch_exception'
                         }, exc_info=True)
-            return self._try_fallback_sources(symbol, start_date, end_date)
+            # 尝试降级并只返回数据字符串
+            fb_res = self._try_fallback_sources(symbol, start_date, end_date)
+            if isinstance(fb_res, tuple):
+                return fb_res[0]
+            return fb_res
+
+    def get_stock_data_all_sources(self, symbol: str, start_date: str = None, end_date: str = None, period: str = "daily") -> Dict[str, str]:
+        """
+        获取所有可用数据源的股票数据（用于多源对比）
+        """
+        results = {}
+        
+        # 获取所有可用数据源
+        available_sources = self.available_sources
+        
+        logger.info(f"📊 [多源获取] 开始获取{symbol}的所有可用数据源数据: {[s.value for s in available_sources]}")
+        
+        for source in available_sources:
+            try:
+                result = None
+                source_name = source.value
+                
+                # 跳过 MongoDB，只关注外部实时数据源
+                if source == ChinaDataSource.MONGODB:
+                    continue
+                    
+                if source == ChinaDataSource.TUSHARE:
+                    result = self._get_tushare_data(symbol, start_date, end_date, period)
+                elif source == ChinaDataSource.AKSHARE:
+                    result = self._get_akshare_data(symbol, start_date, end_date, period)
+                elif source == ChinaDataSource.BAOSTOCK:
+                    result = self._get_baostock_data(symbol, start_date, end_date, period)
+                else:
+                    continue
+                
+                if result and "❌" not in result and "错误" not in result:
+                    results[source_name] = result
+                    logger.info(f"✅ [多源获取] {source_name} 获取成功")
+                else:
+                    logger.warning(f"⚠️ [多源获取] {source_name} 返回无效数据")
+                    
+            except Exception as e:
+                logger.error(f"❌ [多源获取] {source.value} 获取失败: {e}")
+                
+        return results
 
     def _get_mongodb_data(self, symbol: str, start_date: str, end_date: str, period: str = "daily") -> tuple[str, str | None]:
         """
@@ -1180,6 +1236,51 @@ class DataSourceManager:
             # MongoDB异常，降级到其他数据源
             return self._try_fallback_sources(symbol, start_date, end_date, period)
 
+    def _run_async(self, coroutine):
+        """
+        Helper to run async code from sync context, handling existing loops.
+        """
+        import asyncio
+        try:
+            import nest_asyncio
+        except ImportError:
+            nest_asyncio = None
+        
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+        if loop.is_running():
+            # Try to use nest_asyncio first if available
+            if nest_asyncio:
+                try:
+                    nest_asyncio.apply(loop)
+                    return loop.run_until_complete(coroutine)
+                except Exception as e:
+                    # If we get here, nest_asyncio failed to patch effectively (e.g. uvloop). Fall through to thread fallback.
+                    logger.warning(f"⚠️ nest_asyncio failed to patch loop or run coroutine: {e}. Using thread fallback.")
+            else:
+                 logger.warning("⚠️ Event loop running and nest_asyncio not installed. Using thread fallback (risky).")
+
+            # Fallback logic: Run in a separate thread with a new loop
+            # This is necessary when the main loop is running and unpatchable (or nest_asyncio missing)
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                def run_in_thread():
+                    new_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(new_loop)
+                    try:
+                        return new_loop.run_until_complete(coroutine)
+                    finally:
+                        new_loop.close()
+                
+                future = executor.submit(run_in_thread)
+                return future.result()
+        else:
+            return loop.run_until_complete(coroutine)
+
     def _get_tushare_data(self, symbol: str, start_date: str, end_date: str, period: str = "daily") -> str:
         """使用Tushare获取多周期数据 - 使用provider + 统一缓存"""
         logger.debug(f"📊 [Tushare] 调用参数: symbol={symbol}, start_date={start_date}, end_date={end_date}, period={period}")
@@ -1200,18 +1301,7 @@ class DataSourceManager:
                 # 获取股票基本信息
                 provider = self._get_tushare_adapter()
                 if provider:
-                    import asyncio
-                    try:
-                        loop = asyncio.get_event_loop()
-                        if loop.is_closed():
-                            loop = asyncio.new_event_loop()
-                            asyncio.set_event_loop(loop)
-                    except RuntimeError:
-                        # 在线程池中没有事件循环，创建新的
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-
-                    stock_info = loop.run_until_complete(provider.get_stock_basic_info(symbol))
+                    stock_info = self._run_async(provider.get_stock_basic_info(symbol))
                     stock_name = stock_info.get('name', f'股票{symbol}') if stock_info else f'股票{symbol}'
                 else:
                     stock_name = f'股票{symbol}'
@@ -1228,25 +1318,14 @@ class DataSourceManager:
                 return f"❌ Tushare提供器不可用"
 
             # 使用异步方法获取历史数据
-            import asyncio
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_closed():
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-            except RuntimeError:
-                # 在线程池中没有事件循环，创建新的
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-
-            data = loop.run_until_complete(provider.get_historical_data(symbol, start_date, end_date))
+            data = self._run_async(provider.get_historical_data(symbol, start_date, end_date))
 
             if data is not None and not data.empty:
                 # 保存到缓存
                 self._save_to_cache(symbol, data, start_date, end_date)
 
                 # 获取股票基本信息（异步）
-                stock_info = loop.run_until_complete(provider.get_stock_basic_info(symbol))
+                stock_info = self._run_async(provider.get_stock_basic_info(symbol))
                 stock_name = stock_info.get('name', f'股票{symbol}') if stock_info else f'股票{symbol}'
 
                 # 格式化返回
@@ -1283,25 +1362,14 @@ class DataSourceManager:
             provider = get_akshare_provider()
 
             # 使用异步方法获取历史数据
-            import asyncio
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_closed():
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-            except RuntimeError:
-                # 在线程池中没有事件循环，创建新的
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-
-            data = loop.run_until_complete(provider.get_historical_data(symbol, start_date, end_date, period))
+            data = self._run_async(provider.get_historical_data(symbol, start_date, end_date, period))
 
             duration = time.time() - start_time
 
             if data is not None and not data.empty:
                 # 🔧 修复：使用统一的格式化方法，包含技术指标计算
                 # 获取股票基本信息
-                stock_info = loop.run_until_complete(provider.get_stock_basic_info(symbol))
+                stock_info = self._run_async(provider.get_stock_basic_info(symbol))
                 stock_name = stock_info.get('name', f'股票{symbol}') if stock_info else f'股票{symbol}'
 
                 # 调用统一的格式化方法（包含技术指标计算）
@@ -1327,23 +1395,12 @@ class DataSourceManager:
         provider = get_baostock_provider()
 
         # 使用异步方法获取历史数据
-        import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_closed():
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-        except RuntimeError:
-            # 在线程池中没有事件循环，创建新的
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        data = loop.run_until_complete(provider.get_historical_data(symbol, start_date, end_date, period))
+        data = self._run_async(provider.get_historical_data(symbol, start_date, end_date, period))
 
         if data is not None and not data.empty:
             # 🔧 修复：使用统一的格式化方法，包含技术指标计算
             # 获取股票基本信息
-            stock_info = loop.run_until_complete(provider.get_stock_basic_info(symbol))
+            stock_info = self._run_async(provider.get_stock_basic_info(symbol))
             stock_name = stock_info.get('name', f'股票{symbol}') if stock_info else f'股票{symbol}'
 
             # 调用统一的格式化方法（包含技术指标计算）
@@ -1658,13 +1715,51 @@ class DataSourceManager:
 
             # 🔥 转换为 AKShare 格式的股票代码
             # AKShare 的 stock_individual_info_em 需要使用 "sz000001" 或 "sh600000" 格式
-            if symbol.startswith('6'):
+            if symbol.endswith('.HK') or (symbol.isdigit() and len(symbol) == 5):
+                # 港股处理
+                logger.debug(f"📊 [AKShare股票信息] 识别为港股: {symbol}")
+                try:
+                    # 尝试从港股列表获取信息
+                    hk_list = ak.stock_hk_spot()
+                    if hk_list is not None and not hk_list.empty:
+                        clean_code = symbol.replace('.HK', '')
+                        # 尝试匹配代码
+                        # stock_hk_spot 返回的列名是中文: 代码, 中文名称
+                        if '代码' in hk_list.columns:
+                            stock_row = hk_list[hk_list['代码'] == clean_code]
+                            if not stock_row.empty:
+                                row = stock_row.iloc[0]
+                                name = str(row['中文名称']) if '中文名称' in row else f"港股{clean_code}"
+                                return {
+                                    'symbol': symbol,
+                                    'name': name,
+                                    'source': 'akshare',
+                                    'industry': '未知',
+                                    'area': 'HK'
+                                }
+                        elif 'symbol' in hk_list.columns:
+                            stock_row = hk_list[hk_list['symbol'] == clean_code]
+                            if not stock_row.empty:
+                                row = stock_row.iloc[0]
+                                return {
+                                    'symbol': symbol,
+                                    'name': str(row.get('name', f"港股{clean_code}")),
+                                    'source': 'akshare',
+                                    'industry': '未知',
+                                    'area': 'HK'
+                                }
+                except Exception as e:
+                    logger.warning(f"⚠️ [AKShare股票信息] 获取港股列表失败: {e}")
+                
+                # 港股失败也返回基本结构，避免报错
+                return {'symbol': symbol, 'name': f'港股{symbol}', 'source': 'akshare'}
+            elif symbol.startswith('6') and len(symbol) == 6:
                 # 上海股票：600000 -> sh600000
                 akshare_symbol = f"sh{symbol}"
-            elif symbol.startswith(('0', '3', '2')):
+            elif symbol.startswith(('0', '3', '2')) and len(symbol) == 6:
                 # 深圳股票：000001 -> sz000001
                 akshare_symbol = f"sz{symbol}"
-            elif symbol.startswith(('8', '4')):
+            elif symbol.startswith(('8', '4')) and len(symbol) == 6:
                 # 北京股票：830000 -> bj830000
                 akshare_symbol = f"bj{symbol}"
             else:
@@ -2161,7 +2256,23 @@ def get_china_stock_data_unified(symbol: str, start_date: str, end_date: str) ->
 
     manager = get_data_source_manager()
     logger.info(f"🔍 [股票代码追踪] 调用 manager.get_stock_data，传入参数: symbol='{symbol}', start_date='{start_date}', end_date='{end_date}'")
-    result = manager.get_stock_data(symbol, start_date, end_date)
+    
+    # 尝试多源获取
+    results = manager.get_stock_data_all_sources(symbol, start_date, end_date)
+    
+    if len(results) > 1:
+        logger.info(f"✅ [多源数据] 成功获取 {len(results)} 个数据源的数据")
+        combined_result = f"# 多源数据对比 ({symbol})\n\n"
+        for source, data in results.items():
+            combined_result += f"## 数据源: {source.upper()}\n{data}\n\n"
+        result = combined_result
+    elif len(results) == 1:
+        logger.info(f"✅ [单源数据] 仅获取到 1 个数据源的数据")
+        result = list(results.values())[0]
+    else:
+        logger.warning(f"⚠️ [多源数据] 未获取到有效数据，尝试使用默认逻辑")
+        result = manager.get_stock_data(symbol, start_date, end_date)
+
     # 分析返回结果的详细信息
     if result:
         lines = result.split('\n')
