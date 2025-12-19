@@ -114,11 +114,8 @@ def create_bull_researcher(llm, memory):
 通用规则：请始终使用公司名称而不是股票代码来称呼这家公司
 """
         
-        # 补充轮次状态（作为正文说明，而非 KV 元数据）
-        round_info = f"当前分析阶段：第 {current_round_index + 1} 轮（共 {max_rounds} 轮）"
-        
-        # 将动态上下文拼接到配置指令前
-        system_prompt = context_prefix + "\n" + round_info + "\n\n" + base_prompt
+        # 将动态上下文拼接到配置指令前 (移除 round_info，保持 System Prompt 静态以命中缓存)
+        system_prompt = context_prefix + "\n\n" + base_prompt
         
         messages = [SystemMessage(content=system_prompt)]
         
@@ -140,18 +137,35 @@ def create_bull_researcher(llm, memory):
                     # 1. 注入己方之前的观点 (Memory)
                     if "bull" in round_data:
                         prev_bull_content = round_data["bull"]
+                        if i == 0:
+                            prefix = "【回顾】这是我在【初始阶段】建立的核心论点："
+                        else:
+                            prefix = f"【回顾】这是我在【辩论第 {i} 轮】建立的论点："
                         # 使用 AIMessage 表示这是"我"之前说的话
-                        messages.append(AIMessage(content=f"【回顾】这是我在第 {i+1} 轮建立的论点：\n{prev_bull_content}"))
+                        messages.append(AIMessage(content=f"{prefix}\n{prev_bull_content}"))
                     
                     # 2. 注入对手之前的观点 (Counter-argument)
                     if "bear" in round_data:
                         prev_bear_content = round_data["bear"]
+                        if i == 0:
+                            prefix = "【回顾】这是对手（看跌分析师）在【初始阶段】提出的观点："
+                        else:
+                            prefix = f"【回顾】这是对手（看跌分析师）在【辩论第 {i} 轮】提出的观点："
                         # 使用 HumanMessage 表示这是对手说的话
-                        messages.append(HumanMessage(content=f"【回顾】这是对手（看跌分析师）在第 {i+1} 轮提出的观点：\n{prev_bear_content}"))
+                        messages.append(HumanMessage(content=f"{prefix}\n{prev_bear_content}"))
 
         # --- 3. 轮次触发指令 ---
         # 核心指令已移至 YAML System Prompt 中，这里仅作为触发器
-        trigger_msg = f"现在是第 {current_round_index + 1} 轮。请严格按照 System Prompt 中的【任务指南】开始发言。"
+        
+        # 动态生成轮次说明（放在这里而不是 System Prompt，以利用 Context Caching）
+        if current_round_index == 0:
+            round_context = "当前分析阶段：初始观点陈述（基于第一阶段报告生成初始分析报告）"
+            trigger_msg = f"{round_context}\n请基于提供的基础报告，撰写你的【初始分析报告】。重点阐述核心投资论点，构建完整的逻辑框架。本阶段暂不需要反驳对手（因为辩论尚未开始）。"
+            argument_prefix = "# 【多头分析师 - 初始报告】"
+        else:
+            round_context = f"当前分析阶段：辩论第 {current_round_index} 轮（共 {max_rounds} 轮辩论）"
+            trigger_msg = f"{round_context}\n现在是辩论第 {current_round_index} 轮。请严格按照 System Prompt 中的【任务指南】开始发言。"
+            argument_prefix = f"# 【多头分析师 - 第 {current_round_index} 轮辩论】"
         
         if current_round_index > 0:
             # 再次提醒关注最新一轮的对手观点
@@ -185,7 +199,10 @@ def create_bull_researcher(llm, memory):
         rounds[current_round_index]["bull"] = content
         
         # 累积到最终报告
-        section_title = f"## 第 {current_round_index + 1} 部分：核心投资论点" if current_round_index == 0 else f"## 第 {current_round_index + 1} 部分：针对空方观点的反驳与辩护"
+        if current_round_index == 0:
+            section_title = "## 初始报告：核心投资论点"
+        else:
+            section_title = f"## 第 {current_round_index} 轮辩论报告：针对空方观点的反驳与辩护"
         
         # 防重检查：如果报告中已包含当前章节标题，则不再重复添加
         if section_title in bull_report_content:
@@ -209,7 +226,12 @@ def create_bull_researcher(llm, memory):
             logger.error(f"🐂 [ERROR] 保存报告文件失败: {e}")
 
         # 保持对旧 state 字段的兼容（防止其他节点报错）
-        argument_prefix = f"Bull Analyst (Round {current_round_index}):"
+        # 修复：使用更友好的中文标题替代 "Bull Analyst (Round X)"
+        if current_round_index == 0:
+            argument_prefix = "# 【多头分析师 - 初始报告】"
+        else:
+            argument_prefix = f"# 【多头分析师 - 第 {current_round_index} 轮辩论】"
+            
         # 修复：移除内容截断，确保前端展示和历史记录完整
         argument = f"{argument_prefix}\n{content}"
         
@@ -233,7 +255,7 @@ def create_bull_researcher(llm, memory):
             "rounds": rounds,
             "bull_report_content": bull_report_content,
             "bear_report_content": investment_debate_state.get("bear_report_content", ""), # 保持不变
-            "current_round_index": (investment_debate_state.get("count", 0) + 1) // 2, # 修复：根据 count 自动计算轮次
+            "current_round_index": (investment_debate_state.get("count", 0) + 1) // 2, # 修复：确保下一轮索引正确更新
         }
 
         return {

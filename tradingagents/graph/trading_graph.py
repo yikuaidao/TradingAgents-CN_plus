@@ -794,9 +794,14 @@ class TradingAgentsGraph:
 
         # Initialize components
         # 🔥 [修复] 从配置中读取辩论轮次参数 (优先使用阶段配置)
+        # 注意：用户配置的是"辩论轮次"（不含初始报告），内部逻辑需要+1（包含初始报告轮）
         max_debate_rounds = self.config.get("phase2_debate_rounds")
         if max_debate_rounds is None:
              max_debate_rounds = self.config.get("max_debate_rounds", 1)
+        
+        # 确保转换为整数
+        if max_debate_rounds is not None:
+            max_debate_rounds = int(max_debate_rounds)
         
         if self.config.get("phase2_enabled") is False:
              max_debate_rounds = 0

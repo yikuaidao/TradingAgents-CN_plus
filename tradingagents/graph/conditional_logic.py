@@ -94,7 +94,10 @@ class ConditionalLogic:
     def should_continue_debate(self, state: AgentState) -> str:
         """Determine if debate should continue."""
         current_count = state["investment_debate_state"]["count"]
-        max_count = 2 * self.max_debate_rounds
+        # 修复：max_debate_rounds 指的是"辩论轮次"，不包含初始报告阶段
+        # 因此总轮次应该是 (max_debate_rounds + 1)
+        # 每次交互包含 Bull 和 Bear 各一次，所以乘以 2
+        max_count = 2 * (self.max_debate_rounds + 1)
         current_speaker = state["investment_debate_state"]["current_response"]
 
         # 🔍 详细日志
@@ -106,7 +109,22 @@ class ConditionalLogic:
             logger.info(f"✅ [投资辩论控制] 达到最大次数，结束辩论 -> Research Manager")
             return "Research Manager"
 
-        next_speaker = "Bear Researcher" if current_speaker.startswith("Bull") else "Bull Researcher"
+        # 兼容英文 "Bull" 和中文 "【多头"
+        is_bull = current_speaker.startswith("Bull") or "【多头" in current_speaker
+        # 兼容英文 "Bear" 和中文 "【空头" (防御性编程：显式检查)
+        is_bear = current_speaker.startswith("Bear") or "【空头" in current_speaker
+
+        if is_bull:
+            next_speaker = "Bear Researcher"
+        elif is_bear:
+            next_speaker = "Bull Researcher"
+        else:
+            # 默认回落逻辑：如果无法识别，交替进行
+            # 假设如果上一轮不是 Bull，那下一轮就该 Bull 了（或者反之，取决于设计）
+            # 这里保持原有的 else 逻辑作为兜底
+            next_speaker = "Bull Researcher"
+            logger.warning(f"⚠️ [投资辩论控制] 无法识别发言者身份: {current_speaker[:20]}...，默认跳转 -> {next_speaker}")
+
         logger.info(f"🔄 [投资辩论控制] 继续辩论 -> {next_speaker}")
         return next_speaker
 

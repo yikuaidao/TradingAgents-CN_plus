@@ -1449,10 +1449,8 @@ const getAnalysisReports = (data: any) => {
     // 最终决策 (1个)
     'final_trade_decision': { title: '🎯 最终交易决策', category: '最终决策' },
 
-    // 兼容旧格式
-    'investment_plan': { title: '📋 投资建议', category: '其他' },
-    'investment_debate_state': { title: '🔬 研究团队决策（旧）', category: '其他' },
-    'risk_debate_state': { title: '⚖️ 风险管理团队（旧）', category: '其他' }
+    // 兼容旧格式 - 投资建议保留，其他内部状态隐藏
+    'investment_plan': { title: '📋 投资建议', category: '其他' }
   }
 
   // 从已加载的分析师列表动态生成第1阶段报告映射
