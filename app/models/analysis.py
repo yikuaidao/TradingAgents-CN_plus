@@ -214,29 +214,19 @@ class AnalysisBatchResponse(BaseModel):
     failed_tasks: int
     progress: int
     created_at: datetime
-    started_at: Optional[datetime]
     completed_at: Optional[datetime]
-    parameters: AnalysisParameters
-
-    @field_serializer('created_at', 'started_at', 'completed_at')
+    
+    @field_serializer('created_at', 'completed_at')
     def serialize_datetime(self, dt: Optional[datetime], _info) -> Optional[str]:
-        """序列化 datetime 为 ISO 8601 格式，保留时区信息"""
         if dt:
             return dt.isoformat()
         return None
 
-
 class AnalysisHistoryQuery(BaseModel):
     """分析历史查询参数"""
-    status: Optional[AnalysisStatus] = None
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=10, ge=1, le=100)
+    symbol: Optional[str] = None
+    status: Optional[str] = None
     start_date: Optional[datetime] = None
     end_date: Optional[datetime] = None
-    symbol: Optional[str] = None
-    stock_code: Optional[str] = None  # 兼容字段
-    batch_id: Optional[str] = None
-    page: int = Field(default=1, ge=1)
-    page_size: int = Field(default=20, ge=1, le=100)
-
-    def get_symbol(self) -> Optional[str]:
-        """获取股票代码(兼容旧字段)"""
-        return self.symbol or self.stock_code

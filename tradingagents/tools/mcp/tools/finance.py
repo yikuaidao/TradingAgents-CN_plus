@@ -106,7 +106,7 @@ def get_stock_data(
 
 # --- 1.1 Unified Stock News ---
 
-def _fetch_news_data(stock_code: str, max_news: int = 10) -> list:
+def _fetch_news_data(stock_code: str, max_results: int = 10) -> list:
     """内部辅助函数：获取原始新闻数据列表"""
     news_list = []
 
@@ -138,7 +138,7 @@ def _fetch_news_data(stock_code: str, max_news: int = 10) -> list:
             ]
 
             for query in query_list:
-                cursor = collection.find(query).sort('publish_time', -1).limit(max_news)
+                cursor = collection.find(query).sort('publish_time', -1).limit(max_results)
                 db_items = list(cursor)
                 if db_items:
                     logger.info(f"[MCP新闻工具] ✅ 数据库缓存命中: {len(db_items)} 条")
@@ -175,7 +175,7 @@ def _fetch_news_data(stock_code: str, max_news: int = 10) -> list:
 
                     df = ts_provider.pro.news(src='sina', symbol=clean_code, start_date=start_dt, end_date=end_dt)
                     if df is not None and not df.empty:
-                         df = df.sort_values('datetime', ascending=False).head(max_news)
+                         df = df.sort_values('datetime', ascending=False).head(max_results)
 
                          for _, row in df.iterrows():
                              news_list.append({
@@ -203,7 +203,7 @@ def _fetch_news_data(stock_code: str, max_news: int = 10) -> list:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 try:
-                    return loop.run_until_complete(provider.get_stock_news(symbol=clean_code, limit=max_news))
+                    return loop.run_until_complete(provider.get_stock_news(symbol=clean_code, limit=max_results))
                 finally:
                     loop.close()
 
@@ -308,7 +308,7 @@ def _format_news_list(news_list: list, source_label: str = None) -> str:
 
 def get_stock_news(
     stock_code: str,
-    max_news: int = 10
+    max_results: int = 10
 ) -> str:
     """
     获取指定股票的最新新闻。
@@ -317,7 +317,7 @@ def get_stock_news(
 
     Args:
         stock_code: 股票代码，如 "000001.SZ"(A股)、"AAPL"(美股)、"00700.HK"(港股)
-        max_news: 返回的最大新闻数，建议范围 5-20，默认 10
+        max_results: 返回的最大新闻数，建议范围 5-20，默认 10
 
     Returns:
         JSON 格式的 ToolResult，包含 status、data、error_code、suggestion 字段
@@ -329,7 +329,7 @@ def get_stock_news(
         ))
 
     try:
-        news_list = _fetch_news_data(stock_code, max_news)
+        news_list = _fetch_news_data(stock_code, max_results)
 
         if news_list:
             source = news_list[0].get('source', 'Unknown')
@@ -354,7 +354,7 @@ def get_stock_news(
 
 def get_stock_fundamentals(
     stock_code: str,
-    curr_date: str = None,
+    current_date: str = None,
     start_date: str = None,
     end_date: str = None
 ) -> str:
@@ -365,7 +365,7 @@ def get_stock_fundamentals(
 
     Args:
         stock_code: 股票代码，如 "000001.SZ"(A股)、"AAPL"(美股)、"00700.HK"(港股)
-        curr_date: 当前日期，格式 YYYY-MM-DD，默认今天
+        current_date: 当前日期，格式 YYYY-MM-DD，默认今天
         start_date: 开始日期，格式 YYYY-MM-DD，默认 10 天前
         end_date: 结束日期，格式 YYYY-MM-DD，默认今天
 
@@ -376,14 +376,14 @@ def get_stock_fundamentals(
     start_time = now_utc()
 
     # 设置默认日期
-    if not curr_date:
-        curr_date = get_current_date()
+    if not current_date:
+        current_date = get_current_date()
 
     if not start_date:
         start_date = (now_utc() - timedelta(days=10)).strftime('%Y-%m-%d')
 
     if not end_date:
-        end_date = curr_date
+        end_date = current_date
 
     # 分级分析已废弃，统一使用标准深度
     data_depth = "standard"
@@ -408,8 +408,8 @@ def get_stock_fundamentals(
             # 获取最新股价信息 (仅用于辅助分析，不直接返回)
             current_price_data = ""
             try:
-                recent_end_date = curr_date
-                recent_start_date = (datetime.strptime(curr_date, '%Y-%m-%d') - timedelta(days=2)).strftime('%Y-%m-%d')
+                recent_end_date = current_date
+                recent_start_date = (datetime.strptime(current_date, '%Y-%m-%d') - timedelta(days=2)).strftime('%Y-%m-%d')
 
                 from tradingagents.dataflows.interface import get_china_stock_data_unified
                 current_price_data = get_china_stock_data_unified(stock_code, recent_start_date, recent_end_date)
@@ -484,7 +484,7 @@ def get_stock_fundamentals(
         combined_result = f"""# {stock_code} 基本面分析
 
 **股票类型**: {market_info['market_name']}
-**分析日期**: {curr_date}
+**分析日期**: {current_date}
 **执行时间**: {execution_time:.2f}秒
 
 {chr(10).join(result_data)}
@@ -500,7 +500,7 @@ def get_stock_fundamentals(
 
 def get_stock_sentiment(
     stock_code: str,
-    curr_date: str,
+    current_date: str,
     start_date: str = None,
     end_date: str = None,
     source_name: str = None
@@ -512,7 +512,7 @@ def get_stock_sentiment(
 
     Args:
         stock_code: 股票代码，如 "000001.SZ"(A股)、"AAPL"(美股)、"00700.HK"(港股)
-        curr_date: 当前日期，格式 YYYY-MM-DD
+        current_date: 当前日期，格式 YYYY-MM-DD
         start_date: 保留参数，暂未使用
         end_date: 保留参数，暂未使用
         source_name: 保留参数，暂未使用
@@ -565,7 +565,7 @@ def get_stock_sentiment(
 ## 中文市场情绪分析
 
 **股票**: {stock_code} ({market_info['market_name']})
-**分析日期**: {curr_date}
+**分析日期**: {current_date}
 **分析周期**: 近期新闻
 
 📊 综合情绪评估:
@@ -585,7 +585,7 @@ def get_stock_sentiment(
                 # 备用：Reddit新闻
                 try:
                     from tradingagents.dataflows.interface import get_reddit_company_news
-                    reddit_data = get_reddit_company_news(stock_code, curr_date, 7, 5)
+                    reddit_data = get_reddit_company_news(stock_code, current_date, 7, 5)
                     if reddit_data:
                         result_data.append(f"## Reddit讨论(备用)\n{reddit_data}")
                 except Exception as e:
@@ -600,7 +600,7 @@ def get_stock_sentiment(
                 try:
                     from tradingagents.dataflows.interface import get_finnhub_company_insider_sentiment
 
-                    insider_sentiment = get_finnhub_company_insider_sentiment(stock_code, curr_date, 30)
+                    insider_sentiment = get_finnhub_company_insider_sentiment(stock_code, current_date, 30)
                     if insider_sentiment:
                         result_data.append(f"## 内部人士情绪\n{insider_sentiment}")
                 except Exception as e:
@@ -609,7 +609,7 @@ def get_stock_sentiment(
                 # 尝试获取Reddit讨论
                 try:
                     from tradingagents.dataflows.interface import get_reddit_company_news
-                    reddit_info = get_reddit_company_news(stock_code, curr_date, 7, 5)
+                    reddit_info = get_reddit_company_news(stock_code, current_date, 7, 5)
                     if reddit_info:
                         result_data.append(f"## Reddit讨论\n{reddit_info}")
                 except Exception as e:
@@ -629,7 +629,7 @@ def get_stock_sentiment(
         combined_result = f"""# {stock_code} 市场情绪分析
 
 **股票类型**: {market_info['market_name']}
-**分析日期**: {curr_date}
+**分析日期**: {current_date}
 **执行时间**: {execution_time:.2f}秒
 
 {chr(10).join(result_data)}
@@ -732,34 +732,49 @@ def get_china_market_overview(
     if include_sectors:
         try:
             import akshare as ak
+            import concurrent.futures
 
-            # 获取行业板块涨跌幅
+            # 使用线程池和超时机制执行 AKShare 调用，防止阻塞
+            def fetch_sector_data():
+                # 直接调用，异常由 future.result() 抛出并在主线程捕获
+                return ak.stock_board_industry_name_em()
+
+            sector_df = None
             try:
-                sector_df = ak.stock_board_industry_name_em()
-                if not sector_df.empty:
-                    # 取涨幅前5和跌幅前5
-                    top_sectors = sector_df.head(5)
-                    bottom_sectors = sector_df.tail(5)
-
-                    sector_info = "## 板块表现 (AKShare)\n\n"
-                    sector_info += "### 涨幅前5\n"
-                    for _, row in top_sectors.iterrows():
-                        name = row.get('板块名称', 'N/A')
-                        change = row.get('涨跌幅', 'N/A')
-                        sector_info += f"- {name}: {change}%\n"
-
-                    sector_info += "\n### 跌幅前5\n"
-                    for _, row in bottom_sectors.iterrows():
-                        name = row.get('板块名称', 'N/A')
-                        change = row.get('涨跌幅', 'N/A')
-                        sector_info += f"- {name}: {change}%\n"
-
-                    result_sections.append(sector_info)
-                else:
-                    result_sections.append("## 板块表现\n\n⚠️ 板块数据暂时无法获取")
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(fetch_sector_data)
+                    sector_df = future.result(timeout=15)  # 15秒超时
+            except concurrent.futures.TimeoutError:
+                logger.warning("AKShare 板块数据获取超时 (15s)")
+                result_sections.append("## 板块表现\n\n⚠️ 数据获取超时，请稍后重试")
             except Exception as e:
-                logger.warning(f"获取板块数据失败: {e}")
-                result_sections.append(f"## 板块表现\n\n⚠️ 获取失败: {e}")
+                logger.warning(f"AKShare 板块数据获取异常: {e}")
+                result_sections.append(f"## 板块表现\n\n⚠️ 数据源异常: {e}")
+
+            if sector_df is not None and not sector_df.empty:
+                # 取涨幅前5和跌幅前5
+                top_sectors = sector_df.head(5)
+                bottom_sectors = sector_df.tail(5)
+
+                sector_info = "## 板块表现 (AKShare)\n\n"
+                sector_info += "### 涨幅前5\n"
+                for _, row in top_sectors.iterrows():
+                    name = row.get('板块名称', 'N/A')
+                    change = row.get('涨跌幅', 'N/A')
+                    sector_info += f"- {name}: {change}%\n"
+
+                sector_info += "\n### 跌幅前5\n"
+                for _, row in bottom_sectors.iterrows():
+                    name = row.get('板块名称', 'N/A')
+                    change = row.get('涨跌幅', 'N/A')
+                    sector_info += f"- {name}: {change}%\n"
+
+                result_sections.append(sector_info)
+            elif sector_df is None:
+                # 错误信息已在上面添加
+                pass
+            else:
+                result_sections.append("## 板块表现\n\n⚠️ 板块数据暂时无法获取 (空数据)")
 
         except Exception as e:
             logger.error(f"❌ [MCP中国市场工具] 获取板块数据失败: {e}")

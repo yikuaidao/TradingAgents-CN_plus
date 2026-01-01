@@ -27,17 +27,50 @@ def is_rate_limited(response):
     return response.status_code == 429
 
 
+# 全局变量缓存连接状态
+_GOOGLE_CONNECTABLE = None
+_LAST_CHECK_TIME = 0
+_CHECK_INTERVAL = 300  # 5分钟检查一次
+
+def check_google_connectivity():
+    """快速检查能否连接到Google"""
+    global _GOOGLE_CONNECTABLE, _LAST_CHECK_TIME
+    
+    # 如果已有缓存且未过期，直接返回缓存结果
+    now = time.time()
+    if _GOOGLE_CONNECTABLE is not None and (now - _LAST_CHECK_TIME < _CHECK_INTERVAL):
+        return _GOOGLE_CONNECTABLE
+        
+    try:
+        # 尝试连接Google主页，超时设为3秒
+        logger.info("正在检查Google连通性...")
+        requests.get("https://www.google.com", timeout=3)
+        _GOOGLE_CONNECTABLE = True
+        _LAST_CHECK_TIME = now
+        logger.info("Google连通性检查通过")
+        return True
+    except Exception:
+        _GOOGLE_CONNECTABLE = False
+        _LAST_CHECK_TIME = now
+        logger.warning("Google连通性检查失败，将跳过Google新闻源")
+        return False
+
 @retry(
     retry=(retry_if_result(is_rate_limited) | retry_if_exception_type(requests.exceptions.ConnectionError) | retry_if_exception_type(requests.exceptions.Timeout)),
-    wait=wait_exponential(multiplier=1, min=4, max=60),
-    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    stop=stop_after_attempt(2),
 )
 def make_request(url, headers):
     """Make a request with retry logic for rate limiting and connection issues"""
+    # 检查网络连通性
+    if not check_google_connectivity():
+        raise requests.exceptions.ConnectionError("Google不可访问")
+
     # Random delay before each request to avoid detection
     time.sleep(random.uniform(SLEEP_MIN, SLEEP_MAX))
     # 添加超时参数，设置连接超时和读取超时
-    response = requests.get(url, headers=headers, timeout=(10, 30))  # 连接超时10秒，读取超时30秒
+    # 缩短超时时间以避免长时间阻塞
+    response = requests.get(url, headers=headers, timeout=(5, 10))  # 连接超时5秒，读取超时10秒
     return response
 
 

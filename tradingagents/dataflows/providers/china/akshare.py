@@ -98,96 +98,55 @@ class AKShareProvider(BaseStockDataProvider):
                     """
                     包装requests.get方法，自动添加必要的headers和请求延迟
                     修复AKShare stock_news_em()函数缺少headers的问题
-                    如果可用，使用 curl_cffi 模拟真实浏览器 TLS 指纹
                     """
-                    # 添加请求延迟，避免被反爬虫封禁
-                    # 只对东方财富网的请求添加延迟
-                    if 'eastmoney.com' in url:
-                        current_time = time.time()
-                        time_since_last_request = current_time - last_request_time['time']
-                        if time_since_last_request < 0.5:  # 至少间隔0.5秒
-                            time.sleep(0.5 - time_since_last_request)
-                        last_request_time['time'] = time.time()
-
-                    # 如果是东方财富网的请求，且 curl_cffi 可用，使用它来绕过反爬虫
-                    if use_curl_cffi and 'eastmoney.com' in url:
+                    # 1. 自动添加 User-Agent 和 Referer
+                    headers = kwargs.get('headers', {}) or {}
+                    
+                    if 'User-Agent' not in headers:
+                        headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                    
+                    if 'Referer' not in headers:
+                        headers['Referer'] = 'https://eastmoney.com/'
+                        
+                    kwargs['headers'] = headers
+                    
+                    # 2. 设置超时时间（如果未指定）
+                    if 'timeout' not in kwargs:
+                        kwargs['timeout'] = default_timeout
+                        
+                    # 3. 添加请求延迟（避免频繁请求）
+                    current_time = time.time()
+                    elapsed = current_time - last_request_time['time']
+                    if elapsed < 0.5:  # 最小间隔 0.5 秒
+                        time.sleep(0.5 - elapsed)
+                    last_request_time['time'] = time.time()
+                    
+                    # 4. 优先尝试使用 curl_cffi 发送请求
+                    if use_curl_cffi:
                         try:
-                            # 使用 curl_cffi 模拟 Chrome 120 的 TLS 指纹
-                            # 注意：使用 impersonate 时，不要传递自定义 headers，让 curl_cffi 自动设置
-                            curl_kwargs = {
-                                'timeout': kwargs.get('timeout', default_timeout),
-                                'impersonate': "chrome120"  # 模拟 Chrome 120
-                            }
-
-                            # 只传递非 headers 的参数
-                            if 'params' in kwargs:
-                                curl_kwargs['params'] = kwargs['params']
-                            # 不传递 headers，让 impersonate 自动设置
-                            if 'data' in kwargs:
-                                curl_kwargs['data'] = kwargs['data']
-                            if 'json' in kwargs:
-                                curl_kwargs['json'] = kwargs['json']
-
-                            response = curl_requests.get(url, **curl_kwargs)
-                            # curl_cffi 的响应对象已经兼容 requests.Response
-                            return response
+                            # 转换 kwargs 以适配 curl_cffi
+                            curl_kwargs = kwargs.copy()
+                            if 'proxies' in curl_kwargs:
+                                # curl_cffi proxies 格式可能不同，简单起见先移除
+                                curl_kwargs.pop('proxies')
+                                
+                            # 使用 curl_cffi 模拟 Chrome 指纹
+                            resp = curl_requests.get(
+                                url, 
+                                impersonate="chrome110",
+                                **curl_kwargs
+                            )
+                            return resp
                         except Exception as e:
-                            # curl_cffi 失败，回退到标准 requests
-                            error_msg = str(e)
-                            # 忽略 TLS 库错误和 400 错误的详细日志（这是 Docker 环境的已知问题）
-                            if 'invalid library' not in error_msg and '400' not in error_msg:
-                                logger.warning(f"⚠️ curl_cffi 请求失败，回退到标准 requests: {e}")
-
-                    # 标准 requests 请求（非东方财富网，或 curl_cffi 不可用/失败）
-                    # 设置浏览器请求头
-                    if 'headers' not in kwargs or kwargs['headers'] is None:
-                        kwargs['headers'] = {
-                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                            'Accept-Encoding': 'gzip, deflate, br',
-                            'Referer': 'https://www.eastmoney.com/',
-                            'Connection': 'keep-alive',
-                        }
-                    elif isinstance(kwargs['headers'], dict):
-                        # 如果已有headers，确保包含必要的字段
-                        if 'User-Agent' not in kwargs['headers']:
-                            kwargs['headers']['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                        if 'Referer' not in kwargs['headers']:
-                            kwargs['headers']['Referer'] = 'https://www.eastmoney.com/'
-                        if 'Accept' not in kwargs['headers']:
-                            kwargs['headers']['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
-                        if 'Accept-Language' not in kwargs['headers']:
-                            kwargs['headers']['Accept-Language'] = 'zh-CN,zh;q=0.9,en;q=0.8'
-
-                    # 添加重试机制（最多3次）
-                    max_retries = 3
-                    for attempt in range(max_retries):
-                        try:
-                            return original_get(url, **kwargs)
-                        except Exception as e:
-                            # 检查是否是SSL错误
-                            error_str = str(e)
-                            is_ssl_error = ('SSL' in error_str or 'ssl' in error_str or
-                                          'UNEXPECTED_EOF_WHILE_READING' in error_str)
-
-                            if is_ssl_error and attempt < max_retries - 1:
-                                # SSL错误，等待后重试
-                                wait_time = 0.5 * (attempt + 1)  # 递增等待时间
-                                time.sleep(wait_time)
-                                continue
-                            else:
-                                # 非SSL错误或已达到最大重试次数，直接抛出
-                                raise
-
-                # 应用patch
+                            logger.debug(f"curl_cffi 请求失败，回退到 requests: {e}")
+                            # 回退到 requests
+                            pass
+                            
+                    return original_get(url, **kwargs)
+                
                 requests.get = patched_get
                 requests._akshare_headers_patched = True
-
-                if use_curl_cffi:
-                    logger.info("🔧 已修复AKShare的headers问题，使用 curl_cffi 模拟真实浏览器（Chrome 120）")
-                else:
-                    logger.info("🔧 已修复AKShare的headers问题，并添加请求延迟（0.5秒）")
+                logger.info("🔧 已应用 requests 补丁 (自动添加 Headers/Timeout/RateLimit/CurlCffi)")
 
             self.ak = ak
             self.connected = True

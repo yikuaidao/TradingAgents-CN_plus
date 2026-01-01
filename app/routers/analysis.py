@@ -14,7 +14,7 @@ import asyncio
 
 from app.routers.auth_db import get_current_user
 from app.services.queue_service import get_queue_service, QueueService
-from app.services.analysis_service import get_analysis_service
+# from app.services.analysis_service import get_analysis_service # 移除顶层导入
 from app.services.websocket_manager import get_websocket_manager
 from app.models.analysis import (
     SingleAnalysisRequest, BatchAnalysisRequest, AnalysisParameters,
@@ -51,6 +51,9 @@ async def submit_single_analysis(
         logger.info(f"👤 用户信息: {user}")
         logger.info(f"📊 请求数据: {request}")
 
+        # 延迟导入，避免循环引用
+        from app.services.analysis_service import get_analysis_service
+
         # 立即创建任务记录并返回，不等待执行完成
         analysis_service = get_analysis_service()
         result = await analysis_service.create_analysis_task(user["id"], request)
@@ -69,6 +72,8 @@ async def submit_single_analysis(
 
                 # 重新获取服务实例，确保在正确的上下文中
                 logger.info(f"🔧 [BackgroundTask] 正在获取服务实例...")
+                # 延迟导入，避免循环引用
+                from app.services.analysis_service import get_analysis_service
                 service = get_analysis_service()
                 logger.info(f"✅ [BackgroundTask] 服务实例获取成功: {id(service)}")
 
@@ -111,16 +116,12 @@ async def get_task_status_new(
 ):
     """获取分析任务状态（新版异步实现）"""
     try:
-        # 减少高频轮询日志，避免刷屏
-        # logger.info(f"🔍 [NEW ROUTE] 进入新版状态查询路由: {task_id}")
-        # logger.info(f"👤 [NEW ROUTE] 用户: {user}")
-
+        # 延迟导入，避免循环引用
+        from app.services.analysis_service import get_analysis_service
         analysis_service = get_analysis_service()
-        # logger.info(f"🔧 [NEW ROUTE] 获取分析服务实例: {id(analysis_service)}")
 
         result = await analysis_service.get_task_status(task_id)
-        # logger.info(f"📊 [NEW ROUTE] 查询结果: {result is not None}")
-
+        
         if result:
             return {
                 "success": True,
@@ -177,6 +178,18 @@ async def get_task_status_new(
             # 如果analysis_tasks中没有找到，再从analysis_reports集合中查找（已完成的任务）
             mongo_result = await db.analysis_reports.find_one({"task_id": task_id})
 
+            if not mongo_result:
+                # 兼容旧数据：旧记录可能没有 task_id，尝试通过 analysis_id 查找
+                tasks_doc_for_id = await db.analysis_tasks.find_one(
+                    {"task_id": task_id},
+                    {"result.analysis_id": 1}
+                )
+                if tasks_doc_for_id:
+                    analysis_id = tasks_doc_for_id.get("result", {}).get("analysis_id")
+                    if analysis_id:
+                        logger.info(f"🔎 [STATUS] 按analysis_id兜底查询: {analysis_id}")
+                        mongo_result = await db.analysis_reports.find_one({"analysis_id": analysis_id})
+
             if mongo_result:
                 logger.info(f"✅ [STATUS] 从analysis_reports找到任务: {task_id}")
 
@@ -212,8 +225,8 @@ async def get_task_status_new(
                     "message": "任务状态获取成功（从历史记录恢复）"
                 }
             else:
-                logger.warning(f"❌ [STATUS] MongoDB中也未找到: {task_id} trace={task_id}")
-                raise HTTPException(status_code=404, detail="任务不存在")
+                logger.warning(f"❌ [STATUS] MongoDB中也未找到任务: {task_id}")
+                raise HTTPException(status_code=404, detail=f"任务不存在: {task_id}")
 
     except HTTPException:
         raise
@@ -229,9 +242,11 @@ async def get_task_result(
     """获取分析任务结果"""
     try:
         logger.info(f"🔍 [RESULT] 获取任务结果: {task_id}")
-        logger.info(f"👤 [RESULT] 用户: {user}")
-
+        
+        # 延迟导入，避免循环引用
+        from app.services.analysis_service import get_analysis_service
         analysis_service = get_analysis_service()
+        
         task_status = await analysis_service.get_task_status(task_id)
 
         result_data = None
@@ -725,6 +740,7 @@ async def list_all_tasks(
 ):
     """获取所有任务列表（不限用户）"""
     try:
+        from app.services.analysis_service import get_analysis_service
         logger.info(f"📋 查询所有任务列表")
 
         tasks = await get_analysis_service().list_all_tasks(
@@ -757,6 +773,7 @@ async def list_user_tasks(
 ):
     """获取用户的任务列表"""
     try:
+        from app.services.analysis_service import get_analysis_service
         logger.info(f"📋 查询用户任务列表: {user['id']}")
 
         tasks = await get_analysis_service().list_user_tasks(
@@ -794,7 +811,10 @@ async def submit_batch_analysis(
     try:
         logger.info(f"🎯 [批量分析] 收到批量分析请求: title={request.title}")
 
+        # 延迟导入，避免循环引用
+        from app.services.analysis_service import get_analysis_service
         simple_service = get_analysis_service()
+        
         batch_id = str(uuid.uuid4())
         task_ids: List[str] = []
         mapping: List[Dict[str, str]] = []
@@ -838,6 +858,10 @@ async def submit_batch_analysis(
         # 不使用 BackgroundTasks，因为它是串行执行的
         async def run_concurrent_analysis():
             """并发执行所有分析任务"""
+            # 延迟导入，避免循环引用
+            from app.services.analysis_service import get_analysis_service
+            simple_service = get_analysis_service()
+            
             tasks = []
             for i, symbol in enumerate(stock_symbols):
                 task_id = task_ids[i]
@@ -1008,8 +1032,9 @@ async def get_user_analysis_history(
 ):
     """获取用户分析历史（支持基础筛选与分页）"""
     try:
+        from app.services.analysis_service import get_analysis_service
         query_symbol = symbol or stock_code
-        
+
         # 使用新的 query_user_tasks 方法，支持数据库层面的筛选和分页
         result = await get_analysis_service().query_user_tasks(
             user_id=user["id"],
@@ -1106,6 +1131,7 @@ async def get_zombie_tasks(
         raise HTTPException(status_code=403, detail="仅管理员可访问")
 
     try:
+        from app.services.analysis_service import get_analysis_service
         svc = get_analysis_service()
         zombie_tasks = await svc.get_zombie_tasks(max_running_hours)
 
@@ -1134,6 +1160,7 @@ async def cleanup_zombie_tasks(
         raise HTTPException(status_code=403, detail="仅管理员可访问")
 
     try:
+        from app.services.analysis_service import get_analysis_service
         svc = get_analysis_service()
         result = await svc.cleanup_zombie_tasks(max_running_hours)
 
@@ -1157,6 +1184,7 @@ async def mark_task_as_failed(
     用于手动清理卡住的任务
     """
     try:
+        from app.services.analysis_service import get_analysis_service
         svc = get_analysis_service()
 
         # 更新内存中的任务状态
@@ -1212,6 +1240,7 @@ async def delete_task(
     从内存和数据库中删除任务记录
     """
     try:
+        from app.services.analysis_service import get_analysis_service
         svc = get_analysis_service()
 
         # 从内存中删除任务

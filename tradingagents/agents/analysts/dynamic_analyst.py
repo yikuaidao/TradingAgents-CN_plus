@@ -527,20 +527,31 @@ class DynamicAnalystFactory:
                         **kwargs
                     )
 
-                # 在同步环境中运行异步函数
-                try:
-                    loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
+                # 在同步环境中运行异步函数 - 使用独立线程隔离事件循环，避免死锁
+                import threading
+                result_container = {}
 
-                if loop.is_running():
-                    import concurrent.futures
-                    from concurrent.futures import ThreadPoolExecutor
-                    with ThreadPoolExecutor(max_workers=1) as executor:
-                        result = executor.submit(asyncio.run, check_and_execute()).result()
-                else:
-                    result = asyncio.run(check_and_execute())
+                def run_in_thread():
+                    new_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(new_loop)
+                    try:
+                        result_container['result'] = new_loop.run_until_complete(check_and_execute())
+                    except Exception as e:
+                        result_container['error'] = e
+                    finally:
+                        new_loop.close()
+
+                # 启动独立线程运行异步任务
+                t = threading.Thread(target=run_in_thread)
+                t.start()
+                t.join()  # 等待线程结束
+
+                if 'error' in result_container:
+                    error = result_container['error']
+                    logger.error(f"⚠️ [MCP断路器] 工具 {tool_name} 执行异常: {error}")
+                    return f"❌ 工具 {tool_name} 执行出错: {str(error)}"
+
+                result = result_container.get('result')
 
                 # 检查是否为错误状态
                 if isinstance(result, dict) and result.get("status") in ["error", "disabled"]:
