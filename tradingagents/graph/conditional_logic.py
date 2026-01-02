@@ -37,10 +37,10 @@ class ConditionalLogic:
             return "Research Manager"
 
         # 兼容英文 "Bull" 和中文 "【多头"
-        is_bull = current_speaker.startswith("Bull") or "【多头" in latest_speaker
+        is_bull = latest_speaker.startswith("Bull") or "【多头" in latest_speaker
 
         # 兼容英文 "Bear" 和中文 "【空头" (防御性编程：显式检查)
-        is_bear = current_speaker.startswith("Bear") or "【空头" in latest_speaker
+        is_bear = latest_speaker.startswith("Bear") or "【空头" in latest_speaker
 
         if is_bull:
             next_speaker = "Bear Researcher"

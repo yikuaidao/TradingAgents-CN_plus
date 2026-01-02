@@ -95,7 +95,8 @@
       "Bash(cd:*)",
       "Bash(pip:*)",
       "Bash(node:*)",
-      "Bash(docker:*)"
+      "Bash(docker:*)",
+      "Bash(git:*)"
     ],
     "deny": [],
     "ask": []
