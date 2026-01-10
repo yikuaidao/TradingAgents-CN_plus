@@ -145,7 +145,24 @@ def load_local_mcp_tools(toolkit: Optional[Dict] = None) -> List[Any]:
                     finance.get_hot_news_7x24,      # 21. 7x24快讯
                     finance.get_current_timestamp   # 22. 当前时间戳
                 ]
-                for func in finance_funcs:
+
+                # 🔥 应用数据源过滤器
+                from tradingagents.tools.mcp.data_source_filter import get_filtered_tool_list, get_tool_filter_summary
+
+                # 打印工具过滤摘要
+                summary = get_tool_filter_summary(finance_funcs)
+                logger.info(f"📊 MCP工具加载摘要:")
+                logger.info(f"   总工具数: {summary['total']}")
+                logger.info(f"   仅Tushare: {summary['tushare_only']}个")
+                logger.info(f"   双数据源: {summary['dual_source']}个")
+                logger.info(f"   Tushare状态: {summary['tushare_status']}")
+                logger.info(f"   过滤工具数: {summary['filtered']}")
+                logger.info(f"   可用工具数: {summary['available']}")
+
+                # 应用过滤
+                filtered_funcs = get_filtered_tool_list(finance_funcs)
+
+                for func in filtered_funcs:
                     try:
                         tools.append(lc_tool(func))
                     except Exception as e:

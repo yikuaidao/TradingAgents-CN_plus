@@ -1753,6 +1753,23 @@ class DataSourceManager:
         """
         try:
             import akshare as ak
+            import re
+
+            # 🔥 验证股票代码格式
+            # 修正可能的错误后缀（如 .S2 -> .SZ）
+            original_symbol = symbol
+            if re.match(r'\d{5}\.\w{2}', symbol):
+                # 检查后缀是否是常见的错误
+                suffix = symbol.split('.')[1].upper()
+                # 如果后缀是错误的（如S2），尝试修正
+                if suffix in ['S1', 'S2', 'S3', 'S4', 'S5']:
+                    # 可能是SZ的错误输入
+                    symbol = symbol.replace(f'.{suffix}', '.SZ')
+                    logger.warning(f"⚠️ [AKShare股票信息] 检测到错误后缀，自动修正: {original_symbol} -> {symbol}")
+                elif suffix in ['H1', 'H2', 'H3', 'H4', 'H5']:
+                    # 可能是SH的错误输入
+                    symbol = symbol.replace(f'.{suffix}', '.SH')
+                    logger.warning(f"⚠️ [AKShare股票信息] 检测到错误后缀，自动修正: {original_symbol} -> {symbol}")
 
             # 🔥 转换为 AKShare 格式的股票代码
             # AKShare 的 stock_individual_info_em 需要使用 "sz000001" 或 "sh600000" 格式
@@ -1809,22 +1826,52 @@ class DataSourceManager:
 
             logger.debug(f"📊 [AKShare股票信息] 原始代码: {symbol}, AKShare格式: {akshare_symbol}")
 
-            # 尝试获取个股信息
-            stock_info = ak.stock_individual_info_em(symbol=akshare_symbol)
+            # 🔥 修复：添加更robust的错误处理和数据验证
+            try:
+                # 尝试获取个股信息
+                stock_info = ak.stock_individual_info_em(symbol=akshare_symbol)
 
-            if stock_info is not None and not stock_info.empty:
+                # 🔥 验证返回的数据格式
+                if stock_info is None:
+                    logger.warning(f"⚠️ [AKShare股票信息] API返回None: {symbol}")
+                    return {'symbol': symbol, 'name': f'股票{symbol}', 'source': 'akshare'}
+
+                # 🔥 确保返回的是DataFrame
+                if not hasattr(stock_info, 'empty'):
+                    # 如果返回的不是DataFrame（可能是dict或其他类型），尝试转换
+                    logger.warning(f"⚠️ [AKShare股票信息] 返回类型异常: {type(stock_info)}, {symbol}")
+                    return {'symbol': symbol, 'name': f'股票{symbol}', 'source': 'akshare'}
+
+                if stock_info.empty:
+                    logger.warning(f"⚠️ [AKShare股票信息] 返回空数据: {symbol}")
+                    return {'symbol': symbol, 'name': f'股票{symbol}', 'source': 'akshare'}
+
+                # 🔥 检查是否有必要的列
+                if 'item' not in stock_info.columns:
+                    logger.warning(f"⚠️ [AKShare股票信息] 缺少item列, 可用列: {list(stock_info.columns)}, {symbol}")
+                    return {'symbol': symbol, 'name': f'股票{symbol}', 'source': 'akshare'}
+
                 # 转换为字典格式
                 info = {'symbol': symbol, 'source': 'akshare'}
 
                 # 提取股票名称
-                name_row = stock_info[stock_info['item'] == '股票简称']
-                if not name_row.empty:
-                    stock_name = name_row['value'].iloc[0]
-                    info['name'] = stock_name
-                    logger.info(f"✅ [AKShare股票信息] {symbol} -> {stock_name}")
-                else:
+                try:
+                    name_row = stock_info[stock_info['item'] == '股票简称']
+                    if not name_row.empty and len(name_row) > 0:
+                        # 🔥 使用iloc[0]安全地获取第一行
+                        if 'value' in name_row.columns:
+                            stock_name = name_row['value'].iloc[0]
+                            info['name'] = str(stock_name) if stock_name else f'股票{symbol}'
+                            logger.info(f"✅ [AKShare股票信息] {symbol} -> {stock_name}")
+                        else:
+                            info['name'] = f'股票{symbol}'
+                            logger.warning(f"⚠️ [AKShare股票信息] 缺少value列: {symbol}")
+                    else:
+                        info['name'] = f'股票{symbol}'
+                        logger.warning(f"⚠️ [AKShare股票信息] 未找到股票简称: {symbol}")
+                except Exception as extract_error:
+                    logger.error(f"❌ [AKShare股票信息] 提取名称失败: {extract_error}, {symbol}")
                     info['name'] = f'股票{symbol}'
-                    logger.warning(f"⚠️ [AKShare股票信息] 未找到股票简称: {symbol}")
 
                 # 提取其他信息
                 info['area'] = '未知'  # AKShare没有地区信息
@@ -1833,9 +1880,16 @@ class DataSourceManager:
                 info['list_date'] = '未知'  # 可以通过其他API获取
 
                 return info
-            else:
-                logger.warning(f"⚠️ [AKShare股票信息] 返回空数据: {symbol}")
-                return {'symbol': symbol, 'name': f'股票{symbol}', 'source': 'akshare'}
+
+            except Exception as api_error:
+                # 🔥 捕获AKShare API调用的所有异常
+                error_msg = str(api_error)
+                # 检查是否是常见的错误
+                if "scalar values" in error_msg:
+                    logger.warning(f"⚠️ [AKShare股票信息] API返回格式异常（scalar values）: {symbol}")
+                else:
+                    logger.error(f"❌ [AKShare股票信息] API调用异常: {error_msg}, {symbol}")
+                return {'symbol': symbol, 'name': f'股票{symbol}', 'source': 'akshare', 'error': error_msg}
 
         except Exception as e:
             logger.error(f"❌ [股票信息] AKShare获取失败: {symbol}, 错误: {e}")

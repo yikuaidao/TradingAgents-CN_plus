@@ -385,6 +385,82 @@ class AKShareProvider(BaseStockDataProvider):
             logger.error(f"❌ AKShare获取股票列表失败: {e}")
             return None
 
+    def get_kline(self, code: str, period: str = "daily", start_date: str = None, end_date: str = None, adjust: str = "") -> Optional[List[Dict]]:
+        """
+        获取K线数据（同步版本）
+
+        Args:
+            code: 股票代码（不带后缀，如 "000001"）
+            period: 周期 (daily/weekly/monthly)
+            start_date: 开始日期 (YYYYMMDD)
+            end_date: 结束日期 (YYYYMMDD)
+            adjust: 复权类型 ("": 不复权, "qfq": 前复权, "hfq": 后复权)
+
+        Returns:
+            K线数据列表，格式: [{time, open, high, low, close, volume, amount}, ...]
+        """
+        if not self.connected:
+            return None
+
+        try:
+            logger.info(f"📊 获取AKShare K线: {code}, {period}, {start_date}-{end_date}")
+
+            # 映射周期参数
+            period_map = {
+                "daily": "daily",
+                "day": "daily",
+                "weekly": "weekly",
+                "month": "monthly"
+            }
+            ak_period = period_map.get(period, "daily")
+
+            # 调用AKShare API
+            df = self.ak.stock_zh_a_hist(
+                symbol=code,
+                period=ak_period,
+                start_date=start_date,
+                end_date=end_date,
+                adjust=adjust
+            )
+
+            if df is None or df.empty:
+                logger.warning(f"⚠️ AKShare K线数据为空: {code}")
+                return None
+
+            # 转换为标准格式
+            items = []
+            for _, row in df.iterrows():
+                # AKShare返回的列名映射
+                # 日期列可能是 "日期" 或 "date"
+                time_col = None
+                for col in ["日期", "date", "trade_date"]:
+                    if col in df.columns:
+                        time_col = col
+                        break
+
+                if time_col is None:
+                    logger.warning(f"⚠️ 无法识别时间列，可用列: {list(df.columns)}")
+                    continue
+
+                # 标准化列名
+                item = {
+                    "time": str(row[time_col]),
+                    "open": float(row.get("开盘", row.get("open", 0))),
+                    "high": float(row.get("最高", row.get("high", 0))),
+                    "low": float(row.get("最低", row.get("low", 0))),
+                    "close": float(row.get("收盘", row.get("close", 0))),
+                    "volume": float(row.get("成交量", row.get("volume", 0))),
+                    "amount": float(row.get("成交额", row.get("amount", 0)))
+                }
+                items.append(item)
+
+            logger.info(f"✅ AKShare K线获取成功: {len(items)}条")
+            return items
+
+        except Exception as e:
+            logger.error(f"❌ AKShare获取K线失败: {e}")
+            return None
+
     async def get_stock_list(self, market: str = None) -> List[Dict[str, Any]]:
         """
         获取股票列表
@@ -1478,7 +1554,7 @@ class AKShareProvider(BaseStockDataProvider):
         获取财务数据
 
         Args:
-            code: 股票代码
+            code: 股票代码（支持多种格式：000001.SZ, 000001, SH600000）
 
         Returns:
             财务数据字典
@@ -1491,10 +1567,31 @@ class AKShareProvider(BaseStockDataProvider):
 
             financial_data = {}
 
-            # 1. 获取主要财务指标
+            # 标准化股票代码为不同格式
+            code_6digit = code.replace('.SH', '').replace('.SZ', '').replace('.sh', '').replace('.sz', '').zfill(6)
+
+            # 判断交易所
+            if code.startswith('6'):
+                code_shsz = f"SH{code_6digit}"
+                exchange = "SH"
+            elif code.startswith(('0', '3')):
+                code_shsz = f"SZ{code_6digit}"
+                exchange = "SZ"
+            else:
+                # 从原始代码提取交易所信息
+                if '.SH' in code.upper() or code.startswith('6'):
+                    code_shsz = f"SH{code_6digit}"
+                    exchange = "SH"
+                else:
+                    code_shsz = f"SZ{code_6digit}"
+                    exchange = "SZ"
+
+            logger.debug(f"🔧 代码转换: {code} -> 6位:{code_6digit}, SH/SZ格式:{code_shsz}")
+
+            # 1. 获取主要财务指标（使用6位纯数字）
             try:
                 def fetch_financial_abstract():
-                    return self.ak.stock_financial_abstract(symbol=code)
+                    return self.ak.stock_financial_abstract(symbol=code_6digit)
 
                 main_indicators = await asyncio.to_thread(fetch_financial_abstract)
                 if main_indicators is not None and not main_indicators.empty:
@@ -1503,10 +1600,26 @@ class AKShareProvider(BaseStockDataProvider):
             except Exception as e:
                 logger.debug(f"获取{code}主要财务指标失败: {e}")
 
-            # 2. 获取资产负债表
+            # 2. 获取资产负债表（尝试多个接口和参数）
             try:
                 def fetch_balance_sheet():
-                    return self.ak.stock_balance_sheet_by_report_em(symbol=code)
+                    # 尝试1: 新版接口
+                    try:
+                        return self.ak.stock_balance_sheet_by_report_em(symbol=code_6digit)
+                    except (AttributeError, TypeError):
+                        pass
+
+                    # 尝试2: 旧版接口（不同参数名）
+                    try:
+                        return self.ak.stock_zcfz_em(stock=code_6digit)
+                    except (AttributeError, TypeError):
+                        pass
+
+                    # 尝试3: 无参数名
+                    try:
+                        return self.ak.stock_zcfz_em(code_6digit)
+                    except:
+                        return None
 
                 balance_sheet = await asyncio.to_thread(fetch_balance_sheet)
                 if balance_sheet is not None and not balance_sheet.empty:
@@ -1515,10 +1628,26 @@ class AKShareProvider(BaseStockDataProvider):
             except Exception as e:
                 logger.debug(f"获取{code}资产负债表失败: {e}")
 
-            # 3. 获取利润表
+            # 3. 获取利润表（尝试多个接口和参数）
             try:
                 def fetch_income_statement():
-                    return self.ak.stock_profit_sheet_by_report_em(symbol=code)
+                    # 尝试1: 新版接口
+                    try:
+                        return self.ak.stock_profit_sheet_by_report_em(symbol=code_6digit)
+                    except (AttributeError, TypeError):
+                        pass
+
+                    # 尝试2: 旧版接口（不同参数名）
+                    try:
+                        return self.ak.stock_lrb_em(stock=code_6digit)
+                    except (AttributeError, TypeError):
+                        pass
+
+                    # 尝试3: 无参数名
+                    try:
+                        return self.ak.stock_lrb_em(code_6digit)
+                    except:
+                        return None
 
                 income_statement = await asyncio.to_thread(fetch_income_statement)
                 if income_statement is not None and not income_statement.empty:
@@ -1527,10 +1656,26 @@ class AKShareProvider(BaseStockDataProvider):
             except Exception as e:
                 logger.debug(f"获取{code}利润表失败: {e}")
 
-            # 4. 获取现金流量表
+            # 4. 获取现金流量表（尝试多个接口和参数）
             try:
                 def fetch_cash_flow():
-                    return self.ak.stock_cash_flow_sheet_by_report_em(symbol=code)
+                    # 尝试1: 新版接口
+                    try:
+                        return self.ak.stock_cash_flow_sheet_by_report_em(symbol=code_6digit)
+                    except (AttributeError, TypeError):
+                        pass
+
+                    # 尝试2: 旧版接口（不同参数名）
+                    try:
+                        return self.ak.stock_xjllb_em(stock=code_6digit)
+                    except (AttributeError, TypeError):
+                        pass
+
+                    # 尝试3: 无参数名
+                    try:
+                        return self.ak.stock_xjllb_em(code_6digit)
+                    except:
+                        return None
 
                 cash_flow = await asyncio.to_thread(fetch_cash_flow)
                 if cash_flow is not None and not cash_flow.empty:
